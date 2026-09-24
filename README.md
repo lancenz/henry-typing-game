@@ -20,3 +20,4 @@ The app self-hosts **Atkinson Hyperlegible Next** so lowercase `l`, uppercase `I
 ## Optional AI
 
 Enter an OpenRouter key and chat model in Settings. Reports can then be checked for spelling, grammar, and punctuation; fix highlighted errors and re-check before sending to receive a fictional, explorer-style reply. Without connectivity or a key the report can be completed with a clearly labeled local reply. Requests are made directly from the browser to OpenRouter; the key is saved locally in SQLite. Browser speech synthesis does not require OpenRouter.
+
