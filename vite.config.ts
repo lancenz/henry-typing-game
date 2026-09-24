@@ -12,7 +12,7 @@ export default defineConfig({
       theme_color: '#152c25', background_color: '#f5f2e9', display: 'standalone',
       icons: [{ src: '/icon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }],
     },
-    workbox: { globPatterns: ['**/*.{js,css,html,svg,wasm}'], maximumFileSizeToCacheInBytes: 8 * 1024 * 1024 },
+    workbox: { globPatterns: ['**/*.{js,css,html,svg,wasm,jpg,webp,woff2}'], maximumFileSizeToCacheInBytes: 8 * 1024 * 1024 },
   })],
   server: { host: true }, preview: { host: true, port: 4173 },
   optimizeDeps: { include: ['sql.js'] },
