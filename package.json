@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite --host",
     "build": "vue-tsc -b && vite build",
-    "test:smoke": "npm run build && node scripts/smoke.mjs",
+    "test:smoke": "npm run build && node scripts/dungeon-check.mjs && node scripts/smoke.mjs",
     "preview": "vite preview --host --port 4173"
   },
   "dependencies": {

@@ -3,11 +3,14 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { missions, source, testTexts } from './data'
 import { animalImages } from './images'
 import { initDb, getResults, getTests, getReports, getSetting, setSetting, saveResult, saveTest, saveReport, type Result, type TestResult, type Report } from './db'
-import { checkReport, replyToReport, type Correction } from './ai'
+import { checkReport, replyToReport, pickMystery, reviewMysteryQuestion, getMysteryHint, beginAdventure, continueAdventure, reviewDungeonAction, type AdventureScene, type Correction } from './ai'
 import { travelRoutes, travelWords, mapPoint } from './travel'
 import { raceWords, raceTerrain, rivalFinishTimes, rivalPath, rivalPosition, type RaceWaypoint } from './race'
+import { shuffledAnswers, normalizeQuestion, isHintRequest, isGameQuestion, isCorrectGuess } from './twenty'
+import { adventureThemes, isAdventureAction, type AdventureTheme } from './adventure'
+import { newDungeon, validDungeonSave, roomDescription, suggestedActions, applyDungeonIntent, itemName, directions, secretKey, stampyAdvice, dungeonContext, type DungeonGame } from './dungeon'
 
-type Page = 'base' | 'map' | 'mission' | 'shelf' | 'test' | 'settings'
+type Page = 'base' | 'map' | 'mission' | 'shelf' | 'test' | 'twenty' | 'adventure' | 'dungeon' | 'settings'
 const page = ref<Page>('base')
 const ready = ref(false)
 const error = ref('')
@@ -17,6 +20,28 @@ const reports = ref<Report[]>([])
 const apiKey = ref('')
 const model = ref('openai/gpt-4o-mini')
 const voice = ref(true)
+const speechLanguage = ref('en-US')
+const speechVoice = ref('')
+const speechVoices = ref<SpeechSynthesisVoice[]>([])
+const speechFeedback = ref('')
+const speechAvailable = 'speechSynthesis' in window
+const voiceKey = (item: SpeechSynthesisVoice) => JSON.stringify([item.voiceURI, item.lang, item.name])
+const speechLanguages = computed(() => [...new Set([speechLanguage.value, ...speechVoices.value.map(item => item.lang)])].sort((a, b) => a.localeCompare(b)))
+const matchingVoices = computed(() => speechVoices.value.filter(item => item.lang.toLowerCase() === speechLanguage.value.toLowerCase()))
+function languageLabel(lang: string) {
+  try { return `${new Intl.DisplayNames(['en'], { type: 'language' }).of(lang) ?? lang} (${lang})` }
+  catch { return lang }
+}
+function refreshVoices() {
+  if (!speechAvailable) return
+  speechVoices.value = speechSynthesis.getVoices()
+}
+function changeSpeechLanguage() { speechVoice.value = ''; speechFeedback.value = '' }
+function stopSpeech() {
+  speechSequence++
+  if (speechAvailable) speechSynthesis.cancel()
+}
+let speechSequence = 0
 const missionIndex = ref(0)
 const phase = ref(0)
 const playing = ref(false)
@@ -29,6 +54,7 @@ const mistakes = ref(0)
 const correct = ref(0)
 const seconds = ref(0)
 const duration = ref(0)
+const countdown = ref(0)
 const started = ref(0)
 const feedback = ref('')
 const outcome = ref({ stars: 0, gold: 0, wpm: 0, accuracy: 0 })
@@ -46,14 +72,67 @@ const testCorrect = ref(0)
 const testMistakes = ref(0)
 const testTime = ref(60)
 const testOutcome = ref({ wpm: 0, accuracy: 0, score: 0, record: false })
+type MysteryMessage = { role: 'player' | 'guide'; text: string }
+const mysteryStatus = ref<'idle' | 'playing' | 'won' | 'lost'>('idle')
+const mysteryAnswer = ref('')
+const mysteryRemaining = ref(20)
+const mysteryMessages = ref<MysteryMessage[]>([])
+const mysteryQuestion = ref('')
+const mysteryLog = ref<HTMLDivElement | null>(null)
+const mysteryCorrections = ref<Correction[]>([])
+const mysteryBusy = ref(false)
+const mysteryError = ref('')
+const mysteryAsked = new Set<string>()
+let mysteryGameId = 0
+type AdventureMessage = { role: 'player' | 'guide'; text: string; choices?: string[] }
+const adventureTheme = ref<AdventureTheme>('harry-potter')
+const adventureStatus = ref<'idle' | 'playing' | 'finished'>('idle')
+const adventureTurn = ref(0)
+const adventureCurrent = ref<AdventureScene | null>(null)
+const adventureMessages = ref<AdventureMessage[]>([])
+const adventureAction = ref('')
+const adventureCorrections = ref<Correction[]>([])
+const adventureError = ref('')
+const adventureBusy = ref(false)
+const adventureLog = ref<HTMLDivElement | null>(null)
+let adventureGameId = 0
+type DungeonMessage = { role: 'player' | 'guide'; text: string }
+const dungeon = ref<DungeonGame | null>(null)
+const dungeonMessages = ref<DungeonMessage[]>([])
+const dungeonAction = ref('')
+const dungeonCorrections = ref<Correction[]>([])
+const dungeonError = ref('')
+const dungeonBusy = ref(false)
+const dungeonLog = ref<HTMLDivElement | null>(null)
+const dungeonInput = ref<HTMLInputElement | null>(null)
+const dungeonMapHover = ref<number | null>(null)
+let dungeonGameId = 0
+const dungeonRoom = computed(() => dungeon.value?.levels[dungeon.value.level]?.rooms[dungeon.value.room])
+const dungeonTooltip = computed(() => {
+  const game = dungeon.value, id = dungeonMapHover.value
+  return game && id !== null && game.visited[game.level]?.includes(id) ? `Room ${id + 1}: ${roomDescription(game, id)}` : ''
+})
+const dungeonMap = computed(() => Array.from({ length: 25 }, (_, id) => {
+  const game = dungeon.value
+  const seen = !!game?.visited[game.level]?.includes(id)
+  const room = game?.levels[game.level]?.rooms[id]
+  const doors = directions.filter(direction => {
+    const door = room?.doors[direction]
+    return !!game && seen && !!door && (!door.secret || game.revealed.includes(secretKey(game.level, Math.min(id, door.to))))
+  })
+  return { id, seen, doors, frontier: doors.filter(direction => !game?.visited[game.level]?.includes(room?.doors[direction]?.to ?? -1)) }
+}))
 const lastFlightKey = ref(0)
 const stallSeconds = ref(10)
 const raceElapsed = ref(0)
-const raceNow = ref(0)
-const boostUntil = ref(0)
 const rivalProgress = ref([0, 0, 0])
 const rivalBoosts = ref([false, false, false])
 let rivalPaths: RaceWaypoint[][] = []
+const raceVisualDistance = ref(0)
+const raceSpeed = ref(0)
+const raceOdometer = ref(0)
+let lastMotionTick = 0
+let lastRaceCorrect = 0
 const rescueLuck = ref(0)
 const rescueHold = ref(0)
 const rescueElapsed = ref(0)
@@ -82,10 +161,10 @@ const isRace = computed(() => phase.value === 3)
 const isRescue = computed(() => phase.value === 4)
 const playerDistance = computed(() => correct.value / Math.max(1, prompts.value.join(' ').length))
 const raceView = .24
-const raceCamera = computed(() => Math.max(-raceView * .14, Math.min(1 - raceView * .82, playerDistance.value - raceView * .34)))
+const raceCamera = computed(() => Math.max(-raceView * .14, Math.min(1 - raceView * .82, raceVisualDistance.value - raceView * .34)))
 const raceWorldStyle = computed(() => ({ width: `${100 / raceView}%`, transform: `translateX(${-raceCamera.value * 100}%)` }))
-const raceSceneryStyle = computed(() => ({ '--race-near-x': `${Math.round(-playerDistance.value * 3700)}px`, '--race-far-x': `${Math.round(-playerDistance.value * 1500)}px` }))
-const boosting = computed(() => raceNow.value < boostUntil.value)
+const raceSceneryStyle = computed(() => ({ '--race-near-x': `${Math.round(-raceOdometer.value)}px`, '--race-far-x': `${Math.round(-raceOdometer.value * .42)}px`, '--race-road-x': `${Math.round(-raceOdometer.value * 1.5)}px` }))
+const boosting = computed(() => raceSpeed.value >= 60)
 const flightStops = computed(() => travelRoutes[missionIndex.value]!.map(stop => ({ ...stop, ...mapPoint(stop) })))
 const flightProgress = computed(() => Math.min(1, (promptIndex.value + character.value / Math.max(1, currentPrompt.value.length)) / Math.max(1, prompts.value.length)))
 const flightPosition = computed(() => {
@@ -129,28 +208,61 @@ const shownKey = computed(() => expected.value === ' ' ? 'SPACE' : expected.valu
 
 function refresh() { results.value = getResults(); tests.value = getTests(); reports.value = getReports() }
 onMounted(async () => {
-  try { await initDb(); refresh(); apiKey.value = getSetting('key'); model.value = getSetting('model') || model.value; voice.value = getSetting('voice') !== 'off'; ready.value = true }
+  if (speechAvailable) { speechSynthesis.addEventListener('voiceschanged', refreshVoices); refreshVoices() }
+  try {
+    await initDb(); refresh(); apiKey.value = getSetting('key'); model.value = getSetting('model') || model.value; voice.value = getSetting('voice') !== 'off'; speechLanguage.value = getSetting('speech-language') || 'en-US'; speechVoice.value = getSetting('speech-voice')
+    const saved = getSetting('dungeon-save')
+    if (saved) {
+      try {
+        const loaded: unknown = JSON.parse(saved)
+        if (validDungeonSave(loaded)) { dungeon.value = loaded; dungeonMessage('guide', loaded.phase === 'maze' ? `Welcome back, Henry! ${roomDescription(loaded)}` : loaded.phase === 'dragon' ? `The dragon watches you closely. ${stampyAdvice(loaded)}` : 'Welcome back! You and your dragon friend already found your way out.') }
+      } catch { /* An invalid saved game does not prevent the rest of the app from loading. */ }
+    }
+    ready.value = true
+  }
   catch (e) { error.value = `Could not open local game data: ${String(e)}` }
 })
-onUnmounted(() => { stopTick(); speechSynthesis.cancel() })
+onUnmounted(() => { stopTick(); stopSpeech(); if (speechAvailable) speechSynthesis.removeEventListener('voiceschanged', refreshVoices) })
 function stopTick() { if (tick) clearInterval(tick); tick = undefined }
-function speak(text: string) {
-  if (!voice.value || !('speechSynthesis' in window)) return
-  speechSynthesis.cancel()
-  const utterance = new SpeechSynthesisUtterance(text)
-  utterance.rate = 0.82; utterance.pitch = 1.05; utterance.lang = 'en-US'
-  speechSynthesis.speak(utterance)
+function speak(text: string, preview = false) {
+  if (!voice.value || !speechAvailable) return
+  stopSpeech()
+  const sequence = speechSequence
+  const local = speechVoices.value.find(item => item.localService && item.lang.toLowerCase() === speechLanguage.value.toLowerCase())
+    ?? speechVoices.value.find(item => item.localService && item.lang.toLowerCase().startsWith('en'))
+    ?? speechVoices.value.find(item => item.localService)
+  const selected = speechVoices.value.find(item => voiceKey(item) === speechVoice.value && item.lang.toLowerCase() === speechLanguage.value.toLowerCase())
+  const chosen = selected && (online.value || selected.localService) ? selected : !online.value ? local : undefined
+  if (preview) speechFeedback.value = chosen && chosen !== selected ? `Using offline voice ${chosen.name}.` : ''
+  function play(item?: SpeechSynthesisVoice, retry = false) {
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.rate = 0.82; utterance.pitch = 1.05; utterance.lang = item?.lang ?? speechLanguage.value
+    if (item) utterance.voice = item
+    utterance.onerror = event => {
+      if (sequence !== speechSequence || event.error === 'canceled' || event.error === 'interrupted') return
+      if (!retry && local && local !== item) {
+        if (preview) speechFeedback.value = `That voice could not play; trying offline voice ${local.name}.`
+        play(local, true)
+      } else if (preview) speechFeedback.value = 'This voice could not play. Try another voice or install a local voice.'
+    }
+    speechSynthesis.speak(utterance)
+  }
+  play(chosen)
 }
-function go(where: Page) { stopTick(); playing.value = false; testPlaying.value = false; speechSynthesis.cancel(); page.value = where }
+function testSpeech() {
+  const samples: Record<string, string> = { en: 'Cat. C, A, T. Ready for an adventure, Henry?', es: 'Hola, Henry. ¿Listo para una aventura?', fr: 'Bonjour Henry. Prêt pour une aventure ?', de: 'Hallo Henry. Bereit für ein Abenteuer?', it: 'Ciao Henry. Pronto per un’avventura?', pt: 'Olá Henry. Pronto para uma aventura?' }
+  speak(samples[speechLanguage.value.split('-')[0]!] ?? 'Hello, Henry!', true)
+}
+function go(where: Page) { stopTick(); countdown.value = 0; playing.value = false; testPlaying.value = false; stopSpeech(); page.value = where; if (where === 'settings') refreshVoices() }
 function openMission(index: number) {
   if (index >= unlocked.value) return
-  stopTick(); missionIndex.value = index; phase.value = 0; playing.value = false; finished.value = false
+  stopTick(); countdown.value = 0; missionIndex.value = index; phase.value = 0; playing.value = false; finished.value = false
   failed.value = false; reportText.value = reports.value.find(r => r.mission === index + 1)?.text ?? ''
   reportReply.value = ''
   corrections.value = []; checkedText.value = ''; aiError.value = ''; page.value = 'mission'
 }
 function nextPhase() {
-  stopTick(); playing.value = false; finished.value = false; failed.value = false; feedback.value = ''
+  stopTick(); countdown.value = 0; playing.value = false; finished.value = false; failed.value = false; feedback.value = ''
   if (phase.value === 0) phase.value = 2
   else if (phase.value < 5) phase.value++
   else if (phase.value === 5) phase.value = 6
@@ -166,15 +278,27 @@ function startStage() {
   stopTick()
   prompts.value = stagePrompts(); promptIndex.value = 0; character.value = 0; mistakes.value = 0; correct.value = 0
   failed.value = false; finished.value = false; feedback.value = ''
-  rivalProgress.value = [0, 0, 0]; rivalBoosts.value = [false, false, false]; rivalPaths = rivalFinishTimes.map(rivalPath); raceElapsed.value = 0; boostUntil.value = 0
+  rivalProgress.value = [0, 0, 0]; rivalBoosts.value = [false, false, false]; rivalPaths = rivalFinishTimes.map(rivalPath); raceElapsed.value = 0; raceVisualDistance.value = 0; raceSpeed.value = 0; raceOdometer.value = 0
   rescueKeys.length = 0; rescueLuck.value = 0; rescueHold.value = 0; rescueElapsed.value = 0; rescuePace.value = 0; rescueAccuracy.value = 0
   duration.value = isRoute.value ? 150 : 90
-  seconds.value = duration.value; started.value = Date.now(); lastRescueTick = started.value; raceNow.value = started.value; lastFlightKey.value = started.value; stallSeconds.value = 10; playing.value = true
+  seconds.value = duration.value
+  startCountdown(beginStage)
+}
+function startCountdown(begin: () => void) {
+  const countdownStarted = Date.now()
+  countdown.value = 3
+  tick = setInterval(() => {
+    countdown.value = Math.max(0, 3 - Math.floor((Date.now() - countdownStarted) / 1000))
+    if (countdown.value === 0) { stopTick(); begin() }
+  }, 100)
+}
+function beginStage() {
+  started.value = Date.now(); lastMotionTick = started.value; lastRaceCorrect = started.value; lastRescueTick = started.value; lastFlightKey.value = started.value; stallSeconds.value = 10; playing.value = true
   tick = setInterval(() => {
     const now = Date.now()
     seconds.value = Math.max(0, duration.value - Math.floor((now - started.value) / 1000))
     if (isRoute.value) stallSeconds.value = Math.max(0, 10 - Math.floor((now - lastFlightKey.value) / 1000))
-    if (isRace.value) updateRivals(now)
+    if (isRace.value) { updatePlayerMotion(now); updateRivals(now) }
     if (isRescue.value) updateLuck(now)
     if (playing.value && (seconds.value === 0 || (isRoute.value && stallSeconds.value === 0))) void endStage(true)
   }, 100)
@@ -196,11 +320,22 @@ function updateLuck(now: number) {
   if (rescueHold.value >= 15) void endStage()
 }
 function updateRivals(now: number) {
-  raceNow.value = now
   raceElapsed.value = Math.max(0, (now - started.value) / 1000)
   const positions = rivalPaths.map(path => rivalPosition(path, raceElapsed.value))
   rivalProgress.value = positions.map(position => position.distance)
   rivalBoosts.value = positions.map(position => position.boosting)
+}
+function updatePlayerMotion(now: number) {
+  const delta = Math.min(.1, Math.max(0, (now - lastMotionTick) / 1000))
+  lastMotionTick = now
+  // One second without a correct key starts a smooth 2 mph loss per tick.
+  if (now - lastRaceCorrect >= 1000) raceSpeed.value = Math.max(0, raceSpeed.value - 20 * delta)
+  // The jeep can coast a short distance beyond the typed progress, but it
+  // cannot cross the finish line until the last word has actually been typed.
+  raceOdometer.value += raceSpeed.value * 3.2 * delta
+  const limit = Math.min(.995, playerDistance.value + .055)
+  const remaining = Math.max(0, limit - raceVisualDistance.value)
+  raceVisualDistance.value += Math.min(raceSpeed.value / 900, remaining * 5) * delta
 }
 async function endStage(timeout = false) {
   if (!playing.value) return
@@ -212,19 +347,20 @@ async function endStage(timeout = false) {
   const wpm = Math.round((hits / 5) / (elapsed / 60))
   failed.value = timeout || (isRace.value && elapsed >= 90)
   if (failed.value) { feedback.value = isRescue.value ? 'No sighting on this camera watch. Try again: type steadily and accurately to fill the Luck meter, then keep it green for 15 seconds.' : isRace.value ? 'The poachers are almost at the finish! Reach it within 90 seconds to win. Your next try starts at the line.' : seconds.value === 0 ? 'The flight ran out of time and the plane crashed. Restart from Auckland!' : 'The plane stalled and crashed. Keep typing to stay in the air!'; return }
+  if (isRace.value) { raceVisualDistance.value = 1; raceSpeed.value = 0 }
   const stars = Math.max(1, Math.min(5, Math.floor(wpm * acc / (isRescue.value ? (rescueTarget.value + 2) / 5 : 6))))
   const gold = stars * 10 + Math.round(acc * 10)
   outcome.value = { stars, gold, wpm, accuracy: Math.round(acc * 100) }
   try { await saveResult(mission.value.id, `stage-${phase.value}`, stars, gold, outcome.value.accuracy, wpm); refresh() }
   catch (e) { error.value = `Could not save the result: ${String(e)}` }
-  finished.value = true; speak('Great work, Henry!')
+  finished.value = true; speak('Great work Henry!')
 }
 function typeKey(key: string) {
   if (!playing.value || !currentPrompt.value || key.length !== 1) return
    if (key === expected.value) {
      correct.value++; character.value++; feedback.value = ''
      if (isRoute.value) { lastFlightKey.value = Date.now(); stallSeconds.value = 10 }
-      if (isRace.value) { boostUntil.value = Date.now() + 300; raceNow.value = Date.now() }
+       if (isRace.value) { raceSpeed.value = Math.min(180, raceSpeed.value + 5); lastRaceCorrect = Date.now() }
       if (isRescue.value) rescueKeys.push({ time: Date.now(), correct: true })
      if (character.value >= currentPrompt.value.length) {
         promptIndex.value++; character.value = 0
@@ -232,7 +368,8 @@ function typeKey(key: string) {
         else if (promptIndex.value >= prompts.value.length) void endStage()
     }
   } else {
-     mistakes.value++
+      mistakes.value++
+      if (isRace.value) raceSpeed.value = Math.max(0, raceSpeed.value - 1)
      if (isRescue.value) rescueKeys.push({ time: Date.now(), correct: false })
      feedback.value = `Try ${expected.value === ' ' ? 'Space' : expected.value.toUpperCase()} again. Stay on this letter.`
      if (!isRace.value && !isRescue.value) speak(expected.value === ' ' ? 'space' : expected.value.toUpperCase())
@@ -251,8 +388,13 @@ onMounted(() => { window.addEventListener('keydown', keydown); window.addEventLi
 onUnmounted(() => { window.removeEventListener('keydown', keydown); window.removeEventListener('online', updateOnline); window.removeEventListener('offline', updateOnline) })
 function updateOnline() { online.value = navigator.onLine }
 function startTest() {
+  stopTick()
   testText.value = Array(5).fill(testTexts[tests.value.length % testTexts.length]!).join(' '); testCursor.value = 0; testCorrect.value = 0; testMistakes.value = 0
-  testTime.value = 60; testDone.value = false; testPlaying.value = true; started.value = Date.now()
+  testTime.value = 60; testDone.value = false; testPlaying.value = false
+  startCountdown(beginTest)
+}
+function beginTest() {
+  testPlaying.value = true; started.value = Date.now()
   tick = setInterval(() => {
     testTime.value = Math.max(0, 60 - Math.floor((Date.now() - started.value) / 1000))
     if (testTime.value === 0) void finishTest()
@@ -264,6 +406,152 @@ function testKey(key: string) {
   if (key === testText.value[testCursor.value]) { testCorrect.value++; testCursor.value++ }
   else testMistakes.value++
   if (testCursor.value >= testText.value.length) testText.value += ' ' + testTexts[0]
+}
+function mysteryMessage(role: MysteryMessage['role'], text: string) {
+  mysteryMessages.value.push({ role, text })
+  void nextTick(() => { if (mysteryLog.value) mysteryLog.value.scrollTop = mysteryLog.value.scrollHeight })
+}
+function adventureMessage(message: AdventureMessage) {
+  adventureMessages.value.push(message)
+  void nextTick(() => { if (adventureLog.value) adventureLog.value.scrollTop = adventureLog.value.scrollHeight })
+}
+function dungeonMessage(role: DungeonMessage['role'], text: string) {
+  dungeonMessages.value.push({ role, text })
+  void nextTick(() => { if (dungeonLog.value) dungeonLog.value.scrollTop = dungeonLog.value.scrollHeight })
+}
+async function startDungeon() {
+  if (dungeonBusy.value) return
+  if (!apiKey.value.trim() || !online.value) { dungeonError.value = 'Add an OpenRouter key in Settings and connect to play.'; return }
+  dungeonGameId++
+  dungeonBusy.value = true
+  try {
+    dungeon.value = newDungeon()
+    dungeonMessages.value = []
+    dungeonMapHover.value = null
+    dungeonAction.value = ''; dungeonCorrections.value = []; dungeonError.value = ''
+    dungeonMessage('guide', `Level 1 begins. ${roomDescription(dungeon.value)} Stampy says: “I'm lost too. Let's find the five magic stones and get out together!”`)
+    await setSetting('dungeon-save', JSON.stringify(dungeon.value))
+  } catch (e) { dungeonError.value = String(e instanceof Error ? e.message : e) }
+  finally { dungeonBusy.value = false }
+}
+async function sendDungeonAction() {
+  const game = dungeon.value
+  if (!game || game.phase === 'won' || dungeonBusy.value || !online.value) return
+  const action = dungeonAction.value.trim()
+  if (!action) return
+  if (action.length < 5 || !/\p{L}/u.test(action)) { dungeonError.value = 'Type a full action in words, such as “peek through the left door”.'; return }
+  dungeonError.value = ''; dungeonCorrections.value = []; dungeonBusy.value = true
+  const id = dungeonGameId
+  try {
+    const checked = await reviewDungeonAction(apiKey.value, model.value, dungeonContext(game), action)
+    if (id !== dungeonGameId) return
+    if (checked.corrections.length) { dungeonCorrections.value = checked.corrections; return }
+    dungeonAction.value = ''
+    dungeonMessage('player', action)
+    const outcome = applyDungeonIntent(game, checked.intent!)
+    dungeonMessage('guide', outcome.text)
+    if (outcome.changed) await setSetting('dungeon-save', JSON.stringify(game))
+  } catch (e) { if (id === dungeonGameId) dungeonError.value = String(e instanceof Error ? e.message : e) }
+  finally {
+    if (id === dungeonGameId) {
+      dungeonBusy.value = false
+      await nextTick()
+      if (page.value === 'dungeon' && dungeon.value?.phase !== 'won' && online.value) dungeonInput.value?.focus()
+    }
+  }
+}
+function resetAdventure() {
+  adventureGameId++; adventureStatus.value = 'idle'; adventureTurn.value = 0; adventureCurrent.value = null
+  adventureMessages.value = []; adventureAction.value = ''; adventureCorrections.value = []; adventureError.value = ''; adventureBusy.value = false
+}
+async function startAdventure() {
+  if (!apiKey.value.trim() || !online.value) { adventureError.value = 'Add an OpenRouter key in Settings and connect to play.'; return }
+  const game = ++adventureGameId
+  adventureStatus.value = 'idle'; adventureTurn.value = 0; adventureCurrent.value = null; adventureMessages.value = []
+  adventureAction.value = ''; adventureCorrections.value = []; adventureError.value = ''; adventureBusy.value = true
+  try {
+    const theme = adventureThemes.find(item => item.id === adventureTheme.value)!
+    const opening = await beginAdventure(apiKey.value, model.value, theme.setting, crypto.randomUUID())
+    if (game !== adventureGameId) return
+    adventureCurrent.value = opening; adventureStatus.value = 'playing'
+    adventureMessage({ role: 'guide', text: opening.scene, choices: opening.choices })
+  } catch (e) { if (game === adventureGameId) adventureError.value = String(e instanceof Error ? e.message : e) }
+  finally { if (game === adventureGameId) adventureBusy.value = false }
+}
+async function chooseAdventure() {
+  if (adventureStatus.value !== 'playing' || adventureBusy.value || !online.value || !adventureCurrent.value) return
+  const action = adventureAction.value.trim()
+  if (!action) return
+  adventureError.value = ''; adventureCorrections.value = []
+  if (!isAdventureAction(action)) { adventureError.value = 'Type an action in words, such as “follow the path”. Numbers, letters and out-of-story instructions do not count.'; return }
+  adventureBusy.value = true
+  const game = adventureGameId
+  try {
+    const theme = adventureThemes.find(item => item.id === adventureTheme.value)!
+    const reply = await continueAdventure(apiKey.value, model.value, theme.setting, adventureCurrent.value, action, adventureTurn.value + 1)
+    if (game !== adventureGameId) return
+    if (reply.corrections.length) { adventureCorrections.value = reply.corrections; return }
+    adventureMessage({ role: 'player', text: action }); adventureAction.value = ''
+    if (!reply.understood || !reply.story) { adventureMessage({ role: 'guide', text: reply.message }); return }
+    adventureCurrent.value = reply.story; adventureTurn.value++
+    adventureMessage({ role: 'guide', text: reply.story.scene, choices: reply.story.choices })
+    if (adventureTurn.value === 20) adventureStatus.value = 'finished'
+  } catch (e) { if (game === adventureGameId) adventureError.value = String(e instanceof Error ? e.message : e) }
+  finally { if (game === adventureGameId) adventureBusy.value = false }
+}
+function endMystery() {
+  if (mysteryRemaining.value !== 0) return
+  mysteryStatus.value = 'lost'
+  mysteryMessage('guide', `No questions left! I was thinking of ${mysteryAnswer.value}. Want another round?`)
+}
+async function startMystery() {
+  if (!apiKey.value.trim() || !online.value) { mysteryError.value = 'Add an OpenRouter key in Settings and connect to play.'; return }
+  const game = ++mysteryGameId
+  mysteryStatus.value = 'idle'; mysteryAnswer.value = ''; mysteryRemaining.value = 20; mysteryMessages.value = []
+  mysteryQuestion.value = ''; mysteryCorrections.value = []; mysteryError.value = ''; mysteryAsked.clear(); mysteryBusy.value = true
+  try {
+    const answer = await pickMystery(apiKey.value, model.value, shuffledAnswers())
+    if (game !== mysteryGameId) return
+    mysteryAnswer.value = answer; mysteryStatus.value = 'playing'
+    mysteryMessage('guide', 'I have picked something familiar: an animal, a plant, or a material. Ask up to 20 yes-or-no questions to guess it!')
+  } catch (e) { if (game === mysteryGameId) mysteryError.value = String(e instanceof Error ? e.message : e) }
+  finally { if (game === mysteryGameId) mysteryBusy.value = false }
+}
+async function askMystery() {
+  if (mysteryStatus.value !== 'playing' || mysteryBusy.value || !online.value) return
+  const question = mysteryQuestion.value.trim()
+  if (!question) return
+  mysteryError.value = ''; mysteryCorrections.value = []
+  if (isHintRequest(question)) {
+    mysteryMessage('player', question); mysteryQuestion.value = ''
+    if (mysteryRemaining.value >= 10) { mysteryMessage('guide', 'Hints unlock when fewer than 10 questions remain. This did not use a turn.'); return }
+    mysteryBusy.value = true
+    try {
+      const hint = await getMysteryHint(apiKey.value, model.value, mysteryAnswer.value, [...mysteryAsked])
+      mysteryRemaining.value--; mysteryMessage('guide', `Hint: ${hint}`); endMystery()
+    } catch (e) { mysteryError.value = String(e instanceof Error ? e.message : e); mysteryMessage('guide', 'That hint did not work. You kept your turn.') }
+    finally { mysteryBusy.value = false }
+    return
+  }
+  if (!isGameQuestion(question)) {
+    mysteryMessage('player', question); mysteryMessage('guide', 'Please ask a yes-or-no question about the mystery thing. This did not use a turn.'); return
+  }
+  const normalized = normalizeQuestion(question)
+  if (mysteryAsked.has(normalized)) {
+    mysteryMessage('player', question); mysteryMessage('guide', 'You already asked me that! Try a different question. Your turn is safe.'); mysteryQuestion.value = ''; return
+  }
+  mysteryBusy.value = true
+  try {
+    const reply = await reviewMysteryQuestion(apiKey.value, model.value, mysteryAnswer.value, question)
+    if (reply.corrections.length) { mysteryCorrections.value = reply.corrections; return }
+    const correctGuess = isCorrectGuess(question, mysteryAnswer.value)
+    mysteryMessage('player', question); mysteryQuestion.value = ''
+    if (reply.answer === 'clarify') { mysteryMessage('guide', `${reply.message} You kept your turn.`); return }
+    mysteryAsked.add(normalized); mysteryRemaining.value--
+    if (correctGuess) { mysteryStatus.value = 'won'; mysteryMessage('guide', `Yes! You got it — ${mysteryAnswer.value}!`); return }
+    mysteryMessage('guide', reply.message); endMystery()
+  } catch (e) { mysteryError.value = String(e instanceof Error ? e.message : e) }
+  finally { mysteryBusy.value = false }
 }
 async function finishTest() {
   if (!testPlaying.value) return
@@ -277,7 +565,7 @@ async function finishTest() {
   try { await saveTest(wpm, testOutcome.value.accuracy, score); refresh() } catch (e) { error.value = `Could not save the test: ${String(e)}` }
 }
 async function saveSettings() {
-  try { await setSetting('key', apiKey.value.trim()); await setSetting('model', model.value.trim()); await setSetting('voice', voice.value ? 'on' : 'off'); feedback.value = 'Settings saved on this device.' }
+  try { await setSetting('key', apiKey.value.trim()); await setSetting('model', model.value.trim()); await setSetting('voice', voice.value ? 'on' : 'off'); await setSetting('speech-language', speechLanguage.value); await setSetting('speech-voice', speechVoice.value); feedback.value = 'Settings saved on this device.' }
   catch (e) { error.value = `Could not save settings: ${String(e)}` }
 }
 async function checkWriting() {
@@ -320,7 +608,7 @@ function licenseUrl(license: string) {
         <button :class="{active:page==='base'}" @click="go('base')"><span>⌂</span> Base camp</button>
         <button :class="{active:page==='map'||page==='mission'}" @click="go('map')"><span>◇</span> Missions <b>{{ completed.size }}/10</b></button>
         <button :class="{active:page==='shelf'}" @click="go('shelf')"><span>♜</span> Trophy shelf</button>
-        <button :class="{active:page==='test'}" @click="go('test')"><span>◷</span> Typing test</button>
+        <button :class="{active:page==='test'||page==='twenty'||page==='adventure'||page==='dungeon'}" @click="go('test')"><span>◷</span> Typing test</button>
       </nav>
       <div class="side-label tools-label">FIELD TOOLS</div>
       <nav><button :class="{active:page==='settings'}" @click="go('settings')"><span>⚙</span> Settings</button></nav>
@@ -328,7 +616,7 @@ function licenseUrl(license: string) {
     </aside>
 
     <main class="main">
-      <header class="topbar"><div class="breadcrumb">THE EXPEDITION <span>/</span> {{ page === 'mission' ? `MISSION ${mission.id}` : page === 'base' ? 'BASE CAMP' : page.toUpperCase() }}</div><div class="top-actions"><span class="offline-pill"><i></i> {{ online ? 'OFFLINE READY' : 'PLAYING OFFLINE' }}</span><span class="gold-pill">✦ <b>{{ earned }}</b> GOLD</span></div></header>
+      <header class="topbar"><div class="breadcrumb">THE EXPEDITION <span>/</span> {{ page === 'mission' ? `MISSION ${mission.id}` : page === 'base' ? 'BASE CAMP' : page === 'twenty' ? 'TYPING TEST / 20 QUESTIONS' : page === 'adventure' ? 'TYPING TEST / STORY ADVENTURE' : page === 'dungeon' ? 'TYPING TEST / DUNGEON LABYRINTH' : page.toUpperCase() }}</div><div class="top-actions"><span class="offline-pill"><i></i> {{ online ? 'OFFLINE READY' : 'PLAYING OFFLINE' }}</span><span class="gold-pill">✦ <b>{{ earned }}</b> GOLD</span></div></header>
       <div v-if="error" class="error-banner" role="alert">{{ error }} <button @click="error=''">×</button></div>
       <div v-if="!ready && !error" class="loading">Setting up base camp…</div>
 
@@ -345,8 +633,8 @@ function licenseUrl(license: string) {
        <div v-if="ready && page==='mission'" class="content mission-content"><button class="back-link" @click="go('map')">← Back to mission map</button><div class="mission-header"><div><div class="eyebrow">MISSION {{ String(mission.id).padStart(2,'0') }} / 10 · {{ mission.region.toUpperCase() }}</div><h1>{{ mission.animal }}</h1><p>{{ mission.habitat }} · Near {{ mission.place }}, {{ mission.region }}</p></div><div class="mission-icon" :style="{'--accent':mission.color}"><span v-if="isRescue && !finished" aria-label="Animal hidden until camera watch complete">?</span><img v-else :src="animalImages[missionIndex]!.src" :alt="animalImages[missionIndex]!.note"/></div></div>
          <div class="stepper"><div v-for="(label,i) in ['Briefing','Travel','Fieldwork','Rescue','Report']" :key="label" :class="{current:phase===(i===0?0:i+1),passed:phase>(i===0?0:i+1)}"><span>{{ phase>(i===0?0:i+1) ? '✓' : i+1 }}</span>{{ label }}</div></div>
          <template v-if="phase===0"><div class="paper-card brief-card"><div class="eyebrow">✉ &nbsp; INCOMING FIELD MESSAGE</div><h2>Message from your expedition guide</h2><p class="quote">“{{ mission.brief }}”</p><div class="signoff">Adventure awaits, <b>Forrest-inspired guide ✳</b></div></div><div class="fact-strip"><span>ⓘ</span><p><b>Real-world field note:</b> {{ mission.fact }}</p></div><button class="primary-btn" @click="nextPhase">Begin travel <span>→</span></button></template>
-         <template v-else-if="phase>=2 && phase<=4"><div class="game-layout" :class="{'travel-layout':isRoute,'race-layout':isRace,'rescue-layout':isRescue}"><div class="game-main"><div class="paper-card game-card"><div class="game-top"><div><div class="eyebrow">STAGE {{ phase-1 }} OF 3 · {{ phase===2?'TRAVEL':phase===3?'FIELDWORK':'RESCUE' }}</div><h2>{{ stageName }}</h2></div><div v-if="playing" class="timer" :class="{urgent:seconds<12}">◷ {{ seconds }}s</div></div><p v-if="!playing && !finished && !failed" class="game-instruction">{{ isRoute ? `Fly from Auckland to ${mission.place}. Type the words in order to draw your flight path. Keep typing: after 10 seconds without a correct key the plane crashes! You have 2½ minutes. Five stars starts at 30 WPM × accuracy.` : isRace ? `Race three poacher vehicles to the field site through ${mission.habitat.toLowerCase()} country. Each correct key boosts your car; mistakes cost time, but you can catch up. Finish within 90 seconds to win and continue.` : `Finding an animal in the wild requires patience, skill and some luck! Type steadily at ${rescueTarget} adjusted WPM or faster with at least 92% recent accuracy to raise the Luck meter from red to green. Keep typing to hold it green for 15 uninterrupted seconds. You have 90 seconds; otherwise the camera records no sighting and you can try again.` }}</p><div v-if="!playing && !finished && !failed" class="preflight"><span>⌨</span><div><b>Ready when you are.</b><small>{{ isRoute ? '60 familiar words · Space between words · 30 adjusted WPM for ★★★★★' : isRace ? 'Space between words · Rivals finish at 91s, 100s, 110s · 30 adjusted WPM for ★★★★★' : `90-second camera watch · ${rescueTarget} adjusted WPM to fill · ${rescueTarget+2} for ★★★★★` }}</small></div><button class="primary-btn" @click="startStage">{{ isRoute?'Take off →':isRace?'Start race →':'Start camera watch →' }}</button></div>
-            <template v-if="playing || (failed && (isRoute || isRace || isRescue)) || (finished && (isRace || isRescue))">
+         <template v-else-if="phase>=2 && phase<=4"><div class="game-layout" :class="{'travel-layout':isRoute,'race-layout':isRace,'rescue-layout':isRescue}"><div class="game-main"><div class="paper-card game-card"><div class="game-top"><div><div class="eyebrow">STAGE {{ phase-1 }} OF 3 · {{ phase===2?'TRAVEL':phase===3?'FIELDWORK':'RESCUE' }}</div><h2>{{ stageName }}</h2></div><div v-if="playing" class="timer" :class="{urgent:seconds<12}">◷ {{ seconds }}s</div></div><p v-if="!playing && !finished && !failed && !countdown" class="game-instruction">{{ isRoute ? `Fly from Auckland to ${mission.place}. Type the words in order to draw your flight path. Keep typing: after 10 seconds without a correct key the plane crashes! You have 2½ minutes. Five stars starts at 30 WPM × accuracy.` : isRace ? `Race three poacher vehicles to the field site through ${mission.habitat.toLowerCase()} country. Each correct key boosts your car; mistakes cost time, but you can catch up. Finish within 90 seconds to win and continue.` : `Finding an animal in the wild requires patience, skill and some luck! Type steadily at ${rescueTarget} adjusted WPM or faster with at least 92% recent accuracy to raise the Luck meter from red to green. Keep typing to hold it green for 15 uninterrupted seconds. You have 90 seconds; otherwise the camera records no sighting and you can try again.` }}</p><div v-if="!playing && !finished && !failed && !countdown" class="preflight"><span>⌨</span><div><b>Ready when you are.</b><small>{{ isRoute ? '60 familiar words · Space between words · 30 adjusted WPM for ★★★★★' : isRace ? 'Space between words · Rivals finish at 91s, 100s, 110s · 30 adjusted WPM for ★★★★★' : `90-second camera watch · ${rescueTarget} adjusted WPM to fill · ${rescueTarget+2} for ★★★★★` }}</small></div><button class="primary-btn" @click="startStage">{{ isRoute?'Take off →':isRace?'Start race →':'Start camera watch →' }}</button></div><div v-if="countdown" :key="countdown" class="game-countdown" role="status" aria-live="assertive"><strong>{{ countdown }}</strong><span>GET READY · {{ isRoute?'TAKE OFF':isRace?'RACE':'CAMERA WATCH' }}</span></div>
+            <template v-if="playing || countdown || (failed && (isRoute || isRace || isRescue)) || (finished && (isRace || isRescue))">
               <div v-if="isRoute" class="flight-map" :class="{crashed:failed}" role="group" :aria-label="`Flight from Auckland to ${mission.place}; ${Math.round(flightProgress*100)} percent complete`">
                 <div class="flight-world" :style="cameraStyle">
                   <svg class="flight-routes" viewBox="0 0 1000 520" preserveAspectRatio="none" aria-hidden="true"><polyline class="flight-upcoming" :points="routeLine" vector-effect="non-scaling-stroke"/><polyline class="flight-flown" :points="flownLine" vector-effect="non-scaling-stroke"/></svg>
@@ -358,8 +646,8 @@ function licenseUrl(license: string) {
              </div>
               <div v-else-if="isRace" class="race-scene" :class="[`terrain-${raceTerrain[missionIndex]}`,{lost:failed,won:finished,boosting:boosting && playing}]" :style="raceSceneryStyle" role="group" :aria-label="`Race through ${mission.habitat}; you are ${Math.round(playerDistance*100)} percent of the way to the finish`">
                 <div class="race-sky"><div class="race-sun"></div><div class="race-far"></div><div class="race-near"></div><span class="race-place">{{ mission.habitat.toUpperCase() }} · {{ mission.region.toUpperCase() }}</span></div>
-                <div class="race-track"><div class="race-world" :style="raceWorldStyle"><div class="race-finish-line"><span>FINISH</span></div><div v-for="(rival,i) in rivalProgress" :key="i" class="race-lane"><div class="race-car" :class="[`rival-${i}`,{surging:rivalBoosts[i]}]" :style="{left:`${rival*100}%`}"><img :src="`/car-villain-${i+1}.svg`" :alt="`Poacher ${i+1} car`"/><small>POACHER {{ i+1 }}</small></div></div><div class="race-lane player-lane"><div class="race-car player-car" :class="{boost:boosting && playing}" :style="{left:`${playerDistance*100}%`}"><img src="/car-jeep.svg" alt="Henry's expedition jeep"/><small>HENRY</small></div></div></div><div class="race-lane-labels"><span v-for="(time,i) in rivalFinishTimes" :key="i" class="lane-label">{{ ['PURPLE','RED','GOLD'][i] }} · {{ time }}s</span><span class="lane-label">HENRY · YOU</span></div></div>
-               <div class="race-hud"><div class="race-title">{{ finished?'FINISH LINE · HENRY WINS!':failed?'RACE OVER · TRY AGAIN':'TYPE TO BOOST · BEAT 90 SECONDS' }} <span>{{ Math.min(promptIndex+1,prompts.length) }} / {{ prompts.length }} WORDS</span></div><div v-if="playing" class="race-words" aria-label="Words to type"><span v-for="(word,i) in prompts.slice(Math.max(0,promptIndex-1),promptIndex+6)" :key="Math.max(0,promptIndex-1)+i" :class="{past:Math.max(0,promptIndex-1)+i<promptIndex,active:Math.max(0,promptIndex-1)+i===promptIndex}"><template v-if="Math.max(0,promptIndex-1)+i===promptIndex"><b>{{ word.slice(0,character) }}</b><em>{{ expected===' '?'␣':expected }}</em>{{ word.slice(Math.min(character+1,word.length)) }}</template><template v-else>{{ word }}</template></span></div><div v-else class="race-words" :class="{'race-words-lost':failed}">{{ failed?'THE POACHERS ARE CLOSING IN':'YOU MADE IT TO THE FIELD SITE!' }}</div><div class="race-metrics">{{ Math.round(playerDistance*100) }}% to finish · {{ accuracy }}% accuracy · {{ mistakes }} misses <strong>{{ Math.floor(raceElapsed) }} / 90s</strong></div></div>
+                <div class="race-track"><div class="race-world" :style="raceWorldStyle"><div class="race-finish-line"><span>FINISH</span></div><div v-for="(rival,i) in rivalProgress" :key="i" class="race-lane"><div class="race-car" :class="[`rival-${i}`,{surging:rivalBoosts[i]}]" :style="{left:`${rival*100}%`}"><img :src="`/car-villain-${i+1}.svg`" :alt="`Poacher ${i+1} car`"/><small>POACHER {{ i+1 }}</small></div></div><div class="race-lane player-lane"><div class="race-car player-car" :class="{boost:boosting && playing}" :style="{left:`${raceVisualDistance*100}%`}"><img src="/car-jeep.svg" alt="Henry's expedition jeep"/><small>HENRY</small></div></div></div><div class="race-lane-labels"><span v-for="(time,i) in rivalFinishTimes" :key="i" class="lane-label">{{ ['PURPLE','RED','GOLD'][i] }} · {{ time }}s</span><span class="lane-label">HENRY · YOU</span></div></div>
+                <div class="race-hud"><div class="race-title">{{ finished?'FINISH LINE · HENRY WINS!':failed?'RACE OVER · TRY AGAIN':'TYPE TO BOOST · BEAT 90 SECONDS' }} <span>{{ Math.min(promptIndex+1,prompts.length) }} / {{ prompts.length }} WORDS</span></div><div v-if="playing" class="race-words" aria-label="Words to type"><span v-for="(word,i) in prompts.slice(Math.max(0,promptIndex-1),promptIndex+6)" :key="Math.max(0,promptIndex-1)+i" :class="{past:Math.max(0,promptIndex-1)+i<promptIndex,active:Math.max(0,promptIndex-1)+i===promptIndex}"><template v-if="Math.max(0,promptIndex-1)+i===promptIndex"><b>{{ word.slice(0,character) }}</b><em>{{ expected===' '?'␣':expected }}</em>{{ word.slice(Math.min(character+1,word.length)) }}</template><template v-else>{{ word }}</template></span></div><div v-else class="race-words" :class="{'race-words-lost':failed}">{{ failed?'THE POACHERS ARE CLOSING IN':'YOU MADE IT TO THE FIELD SITE!' }}</div><div class="race-metrics">{{ Math.round(playerDistance*100) }}% to finish · {{ accuracy }}% accuracy · {{ mistakes }} misses <span class="race-speed">SPEED {{ Math.round(raceSpeed) }} mph</span><strong>{{ Math.floor(raceElapsed) }} / 90s</strong></div></div>
              </div>
              <div v-else-if="isRescue" class="rescue-scene" :class="[{night:rescueNight,green:rescueLuck>=100,spotted:finished},`habitat-${rescueScene}`]" role="group" :aria-label="`${mission.habitat} camera watch; Luck meter ${Math.round(rescueLuck)} percent; green hold ${Math.floor(rescueHold)} of 15 seconds`">
                <div :key="rescueSceneIndex" class="rescue-frame"><div class="rescue-landscape"></div><div class="rescue-grain"></div></div>
@@ -381,7 +669,96 @@ function licenseUrl(license: string) {
 
       <div v-if="ready && page==='test'" class="content"><div class="page-head"><div class="eyebrow">60-SECOND CHALLENGE</div><h1>Typing <em>test.</em></h1><p>One minute of easy-to-read text. See how far you've come!</p></div><div class="test-layout"><div class="paper-card test-card"><div class="test-top"><div><div class="eyebrow">YOUR PERSONAL BENCHMARK</div><h2>Ready, set, type.</h2></div><div class="timer">◷ {{ testTime }}s</div></div><div v-if="!testPlaying && !testDone" class="test-intro"><p>Type the highlighted text. Mistakes stay on the same letter. Your score is <b>WPM × accuracy</b>; your goal is <b>30 WPM at 95% accuracy</b>.</p><button class="primary-btn" @click="startTest">Start 1-minute test →</button></div><div v-if="testPlaying"><div class="test-paragraph"><span class="typed">{{ testText.slice(Math.max(0,testCursor-65),testCursor) }}</span><span class="cursor-letter">{{ testText[testCursor]===' '?'␣':testText[testCursor] }}</span>{{ testText.slice(testCursor+1,testCursor+170) }}</div><div class="feedback">{{ testMistakes }} mistakes · Keep your eyes on the screen</div><input ref="gameInput" class="capture-input" aria-label="Type the test text here" autocomplete="off" spellcheck="false" @input="($event.target as HTMLInputElement).value=''" /></div><div v-if="testDone" class="test-result"><div class="eyebrow">TEST COMPLETE {{ testOutcome.record?'· NEW PERSONAL BEST! ✦':'' }}</div><div class="result-numbers"><div><strong>{{ testOutcome.wpm }}</strong><small>WORDS / MIN</small></div><div><strong>{{ testOutcome.accuracy }}%</strong><small>ACCURACY</small></div><div><strong>{{ testOutcome.score }}</strong><small>ADJUSTED SCORE</small></div></div><p>Goal: 30 WPM × 95% = <b>28.5 adjusted WPM</b> {{ testOutcome.wpm>=30 && testOutcome.accuracy>=95?'· Goal achieved! 🎉':'' }}</p><button class="primary-btn" @click="startTest">Try again →</button></div></div><aside class="history-card"><div class="eyebrow">YOUR PROGRESS</div><h3>Past tests</h3><p v-if="!tests.length">Your results will appear here after your first test.</p><div v-for="t in tests.slice(0,8)" :key="t.id" class="history-row"><span>{{ dateLabel(t.created_at) }}</span><b>{{ t.score }} <small>score</small></b><span>{{ t.wpm }} WPM · {{ t.accuracy }}%</span></div><div v-if="tests.length>1" class="chart"><div v-for="t in [...tests].reverse().slice(-12)" :key="t.id" :style="{height:Math.max(8,t.score/Math.max(best,1)*100)+'%'}" :title="`${t.score} adjusted WPM`"></div></div></aside></div></div>
 
-      <div v-if="ready && page==='settings'" class="content settings-content"><div class="page-head"><div class="eyebrow">FIELD STATION SETUP</div><h1>Settings <em>& tools.</em></h1><p>Keep your expedition comfortable. Your game progress lives on this device.</p></div><div class="paper-card settings-card"><h2>Voice & sound</h2><label class="toggle-row"><div><b>Speak words & letter hints</b><small>Uses your browser's built-in speech voice, even without an AI key when a local voice is available.</small></div><input v-model="voice" type="checkbox" /></label><button class="secondary-btn" @click="speak('Cat. C, A, T. Ready for an adventure, Henry?')">Test voice ◖))</button><hr><h2>Optional AI field reports</h2><p>OpenRouter checks writing and creates fictional expedition-guide replies. The rest of the game works offline.</p><label class="field-label">OPENROUTER API KEY<input v-model="apiKey" type="password" autocomplete="off" placeholder="sk-or-…" /></label><label class="field-label">CHAT MODEL<input v-model="model" type="text" placeholder="openai/gpt-4o-mini" /></label><p class="small-note">The key is stored locally in this browser's SQLite database. Calls go directly from your browser to OpenRouter; use a restricted key if possible. AI is unavailable without an internet connection.</p><button class="primary-btn" @click="saveSettings">Save settings →</button><span class="setting-feedback" role="status">{{ feedback }}</span></div><div class="fact-strip"><span>ⓘ</span><p>For best offline use, install the PWA from Chrome or Edge after loading it once while online. Local speech voices depend on your operating system.</p></div></div>
+       <div v-if="ready && page==='settings'" class="content settings-content">
+         <div class="page-head"><div class="eyebrow">FIELD STATION SETUP</div><h1>Settings <em>& tools.</em></h1><p>Keep your expedition comfortable. Your game progress lives on this device.</p></div>
+         <div class="paper-card settings-card">
+           <h2>Voice & sound</h2>
+           <label class="toggle-row"><div><b>Speak words & letter hints</b><small>Read letter hints and encouragement aloud.</small></div><input v-model="voice" type="checkbox" /></label>
+           <div class="speech-pickers">
+             <label class="field-label">SPEECH LANGUAGE
+               <select v-model="speechLanguage" aria-label="Speech language" :disabled="!speechAvailable" @change="changeSpeechLanguage">
+                 <option v-for="lang in speechLanguages" :key="lang" :value="lang">{{ languageLabel(lang) }}</option>
+               </select>
+             </label>
+             <label class="field-label">VOICE
+               <select v-model="speechVoice" aria-label="Voice" :disabled="!speechAvailable || !matchingVoices.length">
+                 <option value="">Browser default</option>
+                 <option v-for="item in matchingVoices" :key="voiceKey(item)" :value="voiceKey(item)">{{ item.name }} · {{ item.localService ? 'on this device' : 'may need internet' }}</option>
+               </select>
+             </label>
+           </div>
+           <p class="small-note">{{ !speechAvailable ? 'Speech is not supported in this browser.' : !speechVoices.length ? 'No voices listed yet. Your browser may still be loading them; try Test voice or reopen Settings.' : !matchingVoices.length ? 'No listed voice for this language. The browser will try its default voice.' : 'Voices come from your browser and device. Local voices work offline; online voices may need internet. Language changes pronunciation, not the English game text.' }}</p>
+           <button class="secondary-btn" :disabled="!voice || !speechAvailable" @click="testSpeech">Test voice ◖))</button><span v-if="speechFeedback" class="setting-feedback" role="status">{{ speechFeedback }}</span>
+           <hr><h2>Optional AI field reports</h2><p>OpenRouter checks writing and creates fictional expedition-guide replies. The rest of the game works offline.</p><label class="field-label">OPENROUTER API KEY<input v-model="apiKey" type="password" autocomplete="off" placeholder="sk-or-…" /></label><label class="field-label">CHAT MODEL<input v-model="model" type="text" placeholder="openai/gpt-4o-mini" /></label><p class="small-note">The key is stored locally in this browser's SQLite database. Calls go directly from your browser to OpenRouter; use a restricted key if possible. AI is unavailable without an internet connection.</p><button class="primary-btn" @click="saveSettings">Save settings →</button><span class="setting-feedback" role="status">{{ feedback }}</span>
+         </div>
+         <div class="fact-strip"><span>ⓘ</span><p>For best offline use, install the PWA from Chrome or Edge after loading it once while online. Available speech voices depend on your browser and operating system.</p></div>
+       </div>
+      <div v-if="page==='test' && countdown" :key="countdown" class="game-countdown test-countdown" role="status" aria-live="assertive"><strong>{{ countdown }}</strong><span>GET READY · TYPING TEST</span></div>
+      <section v-if="ready && page==='test'" class="content twenty-promo">
+        <div class="paper-card twenty-promo-card"><div><div class="eyebrow">A NEW WAY TO TYPE</div><h2>Play 20 Questions</h2><p>Guess an everyday animal, plant or material by typing yes-or-no questions. An AI guide answers while you practice spelling.</p></div><button class="primary-btn" @click="go('twenty')">Play 20 Questions →</button></div>
+        <div class="paper-card twenty-promo-card"><div><div class="eyebrow">CHOOSE YOUR OWN PATH</div><h2>Story adventure</h2><p>Pick a favourite theme, then type your way through a short, original adventure with four paths at every turn.</p></div><button class="primary-btn" @click="go('adventure')">Play Story Adventure →</button></div>
+        <div class="paper-card twenty-promo-card"><div><div class="eyebrow">FIVE FLOORS · ONE DRAGON</div><h2>Dungeon labyrinth</h2><p>Explore a changing maze with Stampy the talking cat, collect tools and gold, and type your way past tricky doors.</p></div><button class="primary-btn" @click="go('dungeon')">Play Dungeon Labyrinth →</button></div>
+      </section>
+      <div v-if="ready && page==='twenty'" class="content twenty-content">
+        <button class="back-link" @click="go('test')">← Back to typing test</button>
+        <div class="page-head"><div class="eyebrow">THE MYSTERY GAME</div><h1>20 <em>Questions.</em></h1><p>Ask yes-or-no questions about a familiar animal, plant or material. Guess before your 20 questions run out!</p></div>
+        <div class="twenty-top"><div><b>{{ mysteryStatus==='idle'?'READY TO PLAY':mysteryStatus==='won'?'MYSTERY SOLVED':mysteryStatus==='lost'?'OUT OF QUESTIONS':'MYSTERY IN PROGRESS' }}</b><small>Spelling is checked before a question is sent. Unclear or repeated questions do not use a turn.</small></div><strong>{{ mysteryRemaining }} <span>/ 20 LEFT</span></strong></div>
+        <div class="paper-card twenty-card">
+          <div v-if="mysteryStatus==='idle'" class="twenty-intro"><span class="twenty-icon">?</span><h2>What am I thinking of?</h2><p>The AI picks an easy mystery from everyday animals, plants and materials. Type a question such as “Is it alive?” or guess “Is it a dog?”</p><p>Once fewer than 10 questions remain, type “hint” for a clue. A hint costs one turn.</p><button class="primary-btn" :disabled="mysteryBusy || !apiKey || !online" @click="startMystery">{{ mysteryBusy?'Choosing a mystery…':'Start a mystery →' }}</button><p v-if="!apiKey || !online" class="unavailable">An OpenRouter key and internet connection are needed. <button class="text-btn" @click="go('settings')">Open Settings →</button></p></div>
+          <template v-else><div ref="mysteryLog" class="twenty-chat" role="log" aria-label="20 Questions chat" aria-live="polite"><div v-for="(message,i) in mysteryMessages" :key="i" class="twenty-message" :class="message.role"><small>{{ message.role==='player'?'YOU':'MYSTERY GUIDE' }}</small><p>{{ message.text }}</p></div></div>
+            <div v-if="mysteryStatus==='playing'" class="twenty-controls"><form @submit.prevent="askMystery"><label for="mystery-question">YOUR NEXT QUESTION</label><div class="twenty-input-row"><input id="mystery-question" v-model="mysteryQuestion" type="text" maxlength="160" :disabled="mysteryBusy || !online" placeholder="Is it bigger than a dog?" autocomplete="off"/><button class="primary-btn" type="submit" :disabled="mysteryBusy || !mysteryQuestion.trim() || !online">{{ mysteryBusy?'Checking…':'Ask →' }}</button></div></form><div v-if="mysteryCorrections.length" class="twenty-corrections" role="alert"><b>Fix the spelling, then ask again:</b><p v-for="(item,i) in mysteryCorrections" :key="i"><s>{{ item.original }}</s> → <strong>{{ item.replacement }}</strong> · {{ item.explanation }}</p></div><div class="twenty-foot"><span>Questions left: <b>{{ mysteryRemaining }}</b> <template v-if="mysteryRemaining<10">· A hint costs one turn</template></span><button v-if="mysteryRemaining<10" class="secondary-btn" :disabled="mysteryBusy || !online" @click="mysteryQuestion='hint';askMystery()">Ask for a hint (−1) →</button></div></div>
+            <div v-else class="twenty-finish"><h3>{{ mysteryStatus==='won'?'Great detective work, Henry!':'The mystery is over!' }}</h3><button class="primary-btn" :disabled="mysteryBusy || !online" @click="startMystery">{{ mysteryBusy?'Choosing a mystery…':'Play again →' }}</button></div>
+          </template>
+          <p v-if="mysteryError" class="inline-error" role="alert">{{ mysteryError }}</p>
+        </div>
+      </div>
+      <div v-if="ready && page==='adventure'" class="content twenty-content adventure-content">
+        <button class="back-link" @click="go('test')">← Back to typing test</button>
+        <div class="page-head"><div class="eyebrow">A NEW STORY EACH TIME</div><h1>Story <em>adventure.</em></h1><p>Choose a theme and type what you want to do. Follow a suggested path or try a sensible new idea!</p></div>
+        <div class="twenty-top"><div><b>{{ adventureStatus==='idle'?'CHOOSE A THEME':adventureStatus==='finished'?'THE END':adventureThemes.find(item=>item.id===adventureTheme)?.name.toUpperCase() }}</b><small>Type an action in words · Spelling is checked before the story continues · Unclear actions keep their turn.</small></div><strong>{{ adventureTurn }} <span>/ 20 TURNS</span></strong></div>
+        <div class="paper-card twenty-card adventure-card">
+          <div v-if="adventureStatus==='idle'" class="adventure-intro"><h2>Where shall we go?</h2><p>Every adventure is an original, kid-friendly story. Pick a world, then see where your choices lead.</p><div class="adventure-themes" role="radiogroup" aria-label="Story theme"><label v-for="theme in adventureThemes" :key="theme.id" :class="{selected:adventureTheme===theme.id}"><input v-model="adventureTheme" type="radio" name="adventure-theme" :value="theme.id"/><span><b>{{ theme.name }}</b><small>{{ theme.description }}</small></span></label></div><button class="primary-btn" :disabled="adventureBusy || !apiKey || !online" @click="startAdventure">{{ adventureBusy?'Creating your story…':'Start story →' }}</button><p v-if="!apiKey || !online" class="unavailable">An OpenRouter key and internet connection are needed. <button class="text-btn" @click="go('settings')">Open Settings →</button></p><p class="small-note">Fan adventures are original and unofficial. The Forrest Galante expedition is fictional and makes no claim of a real sighting.</p></div>
+          <template v-else><div ref="adventureLog" class="twenty-chat adventure-chat" role="log" aria-label="Story adventure chat" aria-live="polite"><div v-for="(message,i) in adventureMessages" :key="i" class="twenty-message" :class="message.role"><small>{{ message.role==='player'?'YOU':'STORY GUIDE' }}</small><p>{{ message.text }}</p><div v-if="message.choices?.length" class="adventure-choices"><b>FOUR PATHS</b><ul><li v-for="choice in message.choices" :key="choice">{{ choice }}</li></ul></div></div></div>
+            <div v-if="adventureStatus==='playing'" class="twenty-controls"><form @submit.prevent="chooseAdventure"><label for="adventure-action">WHAT DO YOU DO NEXT?</label><div class="twenty-input-row"><input id="adventure-action" v-model="adventureAction" type="text" maxlength="160" :disabled="adventureBusy || !online" placeholder="Type an action, like follow the path" autocomplete="off"/><button class="primary-btn" type="submit" :disabled="adventureBusy || !adventureAction.trim() || !online">{{ adventureBusy?'Checking…':'Continue story →' }}</button></div></form><div v-if="adventureCorrections.length" class="twenty-corrections" role="alert"><b>Fix the spelling, then try again:</b><p v-for="(item,i) in adventureCorrections" :key="i"><s>{{ item.original }}</s> → <strong>{{ item.replacement }}</strong> · {{ item.explanation }}</p></div><div class="twenty-foot"><span>Turn <b>{{ adventureTurn+1 }}</b> of 20 · Type the action in words, not a number or letter.</span><button class="text-btn" @click="resetAdventure">Change theme →</button></div></div>
+            <div v-else class="twenty-finish"><h3>Adventure complete, Henry!</h3><p>You shaped the ending with your choices.</p><button class="primary-btn" :disabled="adventureBusy || !online" @click="startAdventure">{{ adventureBusy?'Creating your story…':'Another story →' }}</button><button class="secondary-btn" @click="resetAdventure">Choose another theme →</button></div>
+          </template>
+          <p v-if="adventureError" class="inline-error" role="alert">{{ adventureError }}</p>
+        </div>
+      </div>
+      <div v-if="ready && page==='dungeon'" class="content dungeon-content">
+        <button class="back-link" @click="go('test')">← Back to typing test</button>
+        <div class="page-head"><div class="eyebrow">THE FIVE MAGIC STONES</div><h1>Dungeon <em>labyrinth.</em></h1><p>Type your decisions in full sentences. Peek before entering danger, ask Stampy for help, and collect each stone to reach the dragon.</p></div>
+        <div class="twenty-top"><div><b>{{ !dungeon?'READY TO EXPLORE':dungeon.phase==='won'?'FRIENDS WITH A DRAGON':dungeon.phase==='dragon'?'THE DRAGON AWAITS':`LEVEL ${dungeon.level+1} · ${dungeonRoom?.title.toUpperCase()}` }}</b><small>Five levels · 25 rooms each · Spelling is checked before your action counts · Map and items survive a death.</small></div><strong>{{ dungeon?.stones.length ?? 0 }} <span>/ 5 STONES</span></strong></div>
+        <div v-if="!dungeon" class="paper-card dungeon-intro"><span class="twenty-icon">◇</span><h2>Find your way out together.</h2><p>Each new game creates a fresh five-level maze. A lost talking cat named Stampy will help you; treasures, equipment and explored rooms remain yours if you die. The dragon needs kindness, not a sword.</p><button class="primary-btn" :disabled="dungeonBusy || !apiKey || !online" @click="startDungeon">Start a new dungeon →</button><p v-if="!apiKey || !online" class="unavailable">An OpenRouter key and internet connection are needed for typed actions. <button class="text-btn" @click="go('settings')">Open Settings →</button></p></div>
+        <div v-else class="dungeon-layout">
+          <section class="paper-card dungeon-main">
+            <div v-if="dungeon.phase==='maze'" class="dungeon-room"><div class="eyebrow">LEVEL {{ dungeon.level+1 }} / 5 · ROOM {{ dungeon.room+1 }} / 25</div><h2>{{ dungeonRoom?.title }}</h2><p>{{ roomDescription(dungeon) }}</p></div>
+            <div v-else class="dungeon-room dragon-room"><div class="eyebrow">{{ dungeon.phase==='won'?'THE END':'THE FINAL CONVERSATION' }}</div><h2>{{ dungeon.phase==='won'?'Ride into the sunset':'The unnamed dragon' }}</h2><p>{{ dungeon.phase==='won'?'You and Stampy have found a new friend.':'A giant fire-breathing dragon watches over its lost stones. It thinks you stole them, and hopes someone will give it a name. Talk kindly, and listen to its answers.' }}</p></div>
+             <div ref="dungeonLog" class="twenty-chat dungeon-chat" role="log" aria-label="Dungeon events" aria-live="polite"><div v-for="(message,i) in dungeonMessages" :key="i" class="twenty-message" :class="message.role"><small>{{ message.role==='player'?'YOU':'DUNGEON GUIDE' }}</small><p>{{ message.text }}</p></div></div>
+             <div v-if="dungeon.phase!=='won'" class="dungeon-choices"><b>FOUR IDEAS · TYPE YOUR OWN ACTION</b><ol v-if="dungeon.phase==='maze'"><li v-for="choice in suggestedActions(dungeon)" :key="choice">{{ choice }}</li></ol><ol v-else><li>Ask the dragon about its lost stones</li><li>Return the five magic stones</li><li>Offer the dragon a friendly name</li><li>Say something kind to the dragon</li></ol></div>
+             <div v-if="dungeon.phase!=='won'" class="twenty-controls"><form @submit.prevent="sendDungeonAction"><label for="dungeon-action">WHAT DO YOU DO NEXT?</label><div class="twenty-input-row"><input id="dungeon-action" ref="dungeonInput" v-model="dungeonAction" type="text" maxlength="240" :disabled="dungeonBusy || !online" autocomplete="off" placeholder="I carefully peek through the door on the left…"/><button class="primary-btn" type="submit" :disabled="dungeonBusy || !dungeonAction.trim() || !online">{{ dungeonBusy?'Checking…':'Do it →' }}</button></div></form><div v-if="dungeonCorrections.length" class="twenty-corrections" role="alert"><b>Fix the spelling first; nothing has changed:</b><p v-for="(item,i) in dungeonCorrections" :key="i"><s>{{ item.original }}</s> → <strong>{{ item.replacement }}</strong> · {{ item.explanation }}</p></div><p v-if="!online" class="unavailable">Reconnect to send your next action. Your maze is saved on this device.</p></div>
+            <div v-else class="twenty-finish"><h3>Well done, Henry and Stampy!</h3><p>The dragon has its stones back, a kind new name, and two new friends.</p></div>
+            <p v-if="dungeonError" class="inline-error" role="alert">{{ dungeonError }}</p>
+            <button class="text-btn dungeon-restart" :disabled="dungeonBusy || !online" @click="startDungeon">Start a different dungeon →</button>
+          </section>
+          <aside class="dungeon-sidebar">
+            <div class="paper-card dungeon-map-card">
+              <div class="eyebrow">FOG-OF-WAR MAP · LEVEL {{ dungeon.level+1 }}</div>
+              <div class="dungeon-compass" role="img" aria-label="Compass: North at top, East at right, South at bottom, West at left"><span class="compass-north">NORTH</span><span class="compass-west">WEST</span><span class="compass-center">✣</span><span class="compass-east">EAST</span><span class="compass-south">SOUTH</span></div>
+              <div class="dungeon-grid" role="group" aria-label="Map of explored rooms and visible doors">
+                <template v-for="tile in dungeonMap" :key="tile.id">
+                  <button v-if="tile.seen" type="button" class="dungeon-tile visited" :class="{current:dungeon.room===tile.id && dungeon.phase==='maze'}" :aria-label="`Room ${tile.id+1}${dungeon.room===tile.id && dungeon.phase==='maze'?' current':''}: ${roomDescription(dungeon, tile.id)}`" :title="`Room ${tile.id+1}: ${roomDescription(dungeon, tile.id)}`" @mouseenter="dungeonMapHover=tile.id" @mouseleave="dungeonMapHover=null" @focus="dungeonMapHover=tile.id" @blur="dungeonMapHover=null"><span v-for="dir in tile.doors" :key="dir" class="dungeon-door" :class="[`door-${dir}`,{frontier:tile.frontier.includes(dir)}]"></span><b>{{ tile.id+1 }}</b></button>
+                  <div v-else class="dungeon-tile" aria-label="Unexplored room"></div>
+                </template>
+              </div>
+              <p class="dungeon-map-key">Highlighted room: {{ dungeon.room+1 }} · bright door: unexplored passage.</p>
+              <p v-if="dungeonTooltip" class="dungeon-map-tooltip" role="status">{{ dungeonTooltip }}</p><p v-else class="small-note">Hover or focus a visited room to read its description. Type “go to room 12” to return to a visited room.</p>
+            </div>
+            <div class="paper-card dungeon-inventory"><div class="eyebrow">YOUR PACK</div><h3>Inventory</h3><ul><li v-for="item in dungeon.inventory" :key="item">{{ itemName(item) }}</li><li v-if="!dungeon.inventory.length">Empty for now. Pick up anything useful.</li></ul><div class="dungeon-treasures">✦ {{ dungeon.gold }} gold <span>✧ {{ dungeon.stones.length }} / 5 stones</span></div><small>{{ dungeon.deaths }} {{ dungeon.deaths===1?'reset':'resets' }} · Progress kept</small></div>
+            <div class="paper-card dungeon-stampy"><img class="stampy-portrait" src="/stampy-cat.svg" alt="Stampy, a friendly grey short-haired cartoon cat"/><h3>Stampy the cat</h3><p>{{ stampyAdvice(dungeon) }}</p><small>Type “Ask Stampy for advice” for a fresh clue.</small></div>
+          </aside>
+        </div>
+      </div>
     </main>
   </div>
 </template>
