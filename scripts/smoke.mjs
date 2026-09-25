@@ -18,19 +18,26 @@ async function waitForServer() {
   throw new Error('Preview server did not start')
 }
 
-async function stampRoute(page) {
-  for (let i = 0; i < 4; i++) {
-    const name = (await page.locator('.route-scene p b').innerText()).trim()
-    const options = await page.locator('.route-choices button').allTextContents()
-    const index = options.findIndex(option => option.replace('⌖', '').trim() === name)
-    assert.notEqual(index, -1, `Route option missing: ${name}`)
-    await page.locator('.route-choices button').nth(index).click()
-    if (i === 0 && (await page.getByRole('heading', { name: /Miller’s langur/ }).count())) {
-      await page.keyboard.type('x')
-      assert.match(await page.locator('.typing-prompt').innerText(), /Indonesia/)
-    }
-    await page.keyboard.type(name)
+async function flyRoute(page, number) {
+  assert(await page.locator('.flight-map').evaluate(map => getComputedStyle(map).backgroundImage.includes('world-map.svg')))
+  assert.equal(await page.locator('.flight-stop').first().locator('.flight-label').innerText(), 'Auckland')
+  if (number === 1 && process.env.TRAVEL_SCREENSHOT) await page.locator('.flight-map').screenshot({ path: process.env.TRAVEL_SCREENSHOT })
+  if (number === 1) {
+    await page.waitForTimeout(11000)
+    await page.getByRole('heading', { name: 'Flight crashed!' }).waitFor()
+    assert.equal(await page.locator('.flight-map.crashed .flight-plane').count(), 1)
+    await page.getByRole('button', { name: 'Fly again from Auckland' }).click()
+    assert.equal(await page.locator('.flight-stats').innerText().then(text => text.includes('AIR: 10s')), true)
+    await page.keyboard.type('x')
+    assert.equal(await page.locator('.flight-words .active').innerText(), 'cat')
   }
+  const initialPosition = await page.locator('.flight-plane').getAttribute('style')
+  for (let i = 0; i < 60; i++) {
+    const word = (await page.locator('.flight-words .active').innerText()).trim()
+    await page.keyboard.type(word + (i < 59 ? ' ' : ''))
+    if (i === 15) assert.notEqual(await page.locator('.flight-plane').getAttribute('style'), initialPosition)
+  }
+  assert.match(await page.locator('.stage-result .stars').innerText(), /★★★★★/)
   await page.getByRole('button', { name: 'Next stage' }).click()
 }
 
@@ -60,8 +67,8 @@ async function finishMission(page, number) {
   else await page.getByRole('button', { name: 'Next mission' }).click()
   await page.getByRole('button', { name: 'Open your field lesson' }).click()
   await page.getByRole('button', { name: /Let's go to/ }).click()
-  await page.getByRole('button', { name: 'Start stage' }).click()
-  await stampRoute(page)
+  await page.getByRole('button', { name: 'Take off' }).click()
+  await flyRoute(page, number)
   await page.getByRole('button', { name: 'Start stage' }).click()
   if ([3, 5, 9].includes(number)) await playMouse(page)
   else if (number === 4) {
@@ -101,7 +108,8 @@ try {
   await page.getByRole('button', { name: '♜ Trophy shelf' }).click()
   assert.equal(await page.locator('.trophy-card:not(.empty)').count(), 10)
   assert(await page.locator('.trophy-figure img').first().evaluate(image => image.complete && image.naturalWidth > 0))
-  console.log('Smoke test passed: all 10 missions, route, vines, cameras, drone, radio, sonar, journal, mouse surveys, reports, persistent trophies and offline photos.')
+  assert(await page.evaluate(async () => (await fetch('/world-map.svg')).ok))
+  console.log('Smoke test passed: all 10 missions, map flight and crash/retry, stages, reports, persistence and offline assets.')
 } finally {
   await browser?.close()
   server.kill('SIGTERM')

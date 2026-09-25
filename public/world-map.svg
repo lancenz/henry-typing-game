@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 520" role="img" aria-label="Antique style world map with New Zealand at the lower right">
+ <defs>
+  <filter id="paper"><feTurbulence type="fractalNoise" baseFrequency=".045" numOctaves="3" seed="8" stitchTiles="stitch" result="noise"/><feColorMatrix in="noise" type="saturate" values="0"/><feComponentTransfer><feFuncA type="linear" slope=".14"/></feComponentTransfer></filter>
+  <radialGradient id="sea"><stop stop-color="#efe0b2"/><stop offset=".75" stop-color="#d7bc83"/><stop offset="1" stop-color="#b79a6b"/></radialGradient>
+  <linearGradient id="land" x2=".8" y2="1"><stop stop-color="#c6a974"/><stop offset=".5" stop-color="#bca072"/><stop offset="1" stop-color="#a68b62"/></linearGradient>
+ </defs>
+ <rect width="1000" height="520" fill="url(#sea)"/>
+ <g fill="none" stroke="#8c744e" stroke-opacity=".23" stroke-width="1">
+  <path d="M30 70H970 M30 165H970 M30 260H970 M30 355H970 M30 450H970 M135 32V485 M252 32V485 M370 32V485 M488 32V485 M605 32V485 M723 32V485 M840 32V485"/>
+  <path d="M30 260H970 M488 32V485" stroke-width="2"/>
+ </g>
+ <g fill="url(#land)" stroke="#755f43" stroke-width="2.2" stroke-linejoin="round">
+  <path d="M38 111 60 101 72 76 104 57 130 69 142 93 174 98 199 108 212 129 229 140 249 133 267 145 274 165 257 177 250 194 227 193 212 208 197 214 189 239 176 244 171 230 151 223 139 209 126 192 108 193 95 180 73 177 63 160 45 157 34 138Z"/>
+  <path d="M150 205 161 202 176 216 181 235 194 240 198 252 188 253 183 243 172 238 164 221Z"/>
+  <path d="M274 264 292 253 318 261 342 270 354 288 373 294 388 314 381 345 371 359 365 386 351 400 338 430 325 454 307 466 303 441 296 418 287 396 280 383 283 361 268 345 264 323 255 307 261 282Z"/>
+  <path d="M163 45 174 25 199 27 214 39 205 65 188 75 166 70Z"/>
+  <path d="M449 116 468 101 485 105 495 95 511 99 524 88 545 92 559 82 583 77 600 88 631 76 665 85 686 82 705 73 735 76 762 89 802 86 833 100 857 111 885 120 904 139 910 166 893 176 885 191 864 191 850 202 834 197 829 211 813 206 806 227 784 230 771 215 751 217 740 234 722 237 700 220 686 221 673 243 654 241 643 260 619 250 612 232 593 234 583 221 569 225 562 210 548 203 537 215 522 202 504 196 494 177 475 174 463 157 445 149Z"/>
+  <path d="M495 227 518 210 539 218 552 232 573 226 593 239 611 262 640 267 658 290 650 322 632 340 626 370 605 391 587 405 579 385 558 377 549 355 533 342 530 318 512 309 507 281 490 267Z"/>
+  <path d="M661 322 668 332 664 355 656 363 650 347Z"/>
+  <path d="M777 287 793 293 802 308 796 321 784 317Z M808 289 818 295 818 307 807 306Z M824 313 833 319 836 335 827 332Z M849 320 862 327 867 341 854 339Z"/>
+  <path d="M817 372 838 350 861 345 881 354 897 353 909 362 925 357 945 375 947 396 933 407 922 421 903 422 886 413 875 426 855 425 845 409 828 405 817 392Z"/>
+  <path d="M886 432 901 433 908 440 902 451 890 449 884 440Z"/>
+  <path d="M950 371 957 379 959 389 951 403 943 410 940 403 946 391 945 380Z M957 408 965 414 963 424 955 441 950 446 948 436 953 420Z"/>
+ </g>
+ <g fill="none" stroke="#6a563b" opacity=".26" stroke-width="1.2">
+  <path d="M79 142q72-31 139 25 M107 154q59-8 91 40 M289 290q40 10 74 63 M303 316q30 24 32 87 M487 139q73-34 167 9 M541 164q92-20 185 13 M582 193q65-4 127 14 M517 252q45 34 69 114 M536 273q48 25 55 63 M837 383q31-12 82 7"/>
+ </g>
+ <g fill="#715f43" font-family="Georgia,serif" font-size="13" font-style="italic" opacity=".6" letter-spacing="2">
+  <text x="404" y="294">ATLANTIC OCEAN</text><text x="110" y="323">PACIFIC OCEAN</text><text x="743" y="368">INDIAN OCEAN</text><text x="484" y="63">EUROPE</text><text x="317" y="234">SOUTH AMERICA</text>
+ </g>
+ <g transform="translate(73 409)" fill="none" stroke="#665239" opacity=".6"><circle r="27"/><circle r="21"/><path d="M-32 0H32 M0-32V32 M-15-15 15 15 M15-15-15 15"/><text x="-5" y="-35" font-family="Georgia" font-size="12" fill="#665239" stroke="none">N</text></g>
+ <rect width="1000" height="520" filter="url(#paper)" opacity=".95"/>
+ <rect x="9" y="9" width="982" height="502" fill="none" stroke="#70583b" stroke-width="2" opacity=".55"/>
+ <rect x="16" y="16" width="968" height="488" fill="none" stroke="#765c3d" opacity=".35"/>
+</svg>
