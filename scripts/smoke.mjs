@@ -19,7 +19,7 @@ async function waitForServer() {
 }
 
 async function flyRoute(page, number) {
-  assert(await page.locator('.flight-map').evaluate(map => getComputedStyle(map).backgroundImage.includes('world-map.svg')))
+  assert(await page.locator('.flight-world').evaluate(map => getComputedStyle(map).backgroundImage.includes('world-map.svg')))
   assert.equal(await page.locator('.flight-stop').first().locator('.flight-label').innerText(), 'Auckland')
   if (number === 1 && process.env.TRAVEL_SCREENSHOT) await page.locator('.flight-map').screenshot({ path: process.env.TRAVEL_SCREENSHOT })
   if (number === 1) {
@@ -32,10 +32,24 @@ async function flyRoute(page, number) {
     assert.equal(await page.locator('.flight-words .active').innerText(), 'cat')
   }
   const initialPosition = await page.locator('.flight-plane').getAttribute('style')
+  const initialCamera = await page.locator('.flight-world').getAttribute('style')
   for (let i = 0; i < 60; i++) {
     const word = (await page.locator('.flight-words .active').innerText()).trim()
     await page.keyboard.type(word + (i < 59 ? ' ' : ''))
     if (i === 15) assert.notEqual(await page.locator('.flight-plane').getAttribute('style'), initialPosition)
+    if (i === 44 && number === 3) {
+      await page.waitForTimeout(450)
+      assert.notEqual(await page.locator('.flight-world').getAttribute('style'), initialCamera)
+      if (process.env.TRAVEL_MID_SCREENSHOT) await page.locator('.flight-map').screenshot({ path: process.env.TRAVEL_MID_SCREENSHOT })
+    }
+    if (i === 55) {
+      await page.waitForTimeout(450)
+      const bounds = await page.locator('.flight-stop.destination').evaluate(destination => {
+        const stop = destination.getBoundingClientRect(), map = destination.closest('.flight-map').getBoundingClientRect()
+        return { visible: stop.left >= map.left && stop.right <= map.right && stop.top >= map.top && stop.bottom <= map.bottom, stop: [stop.left,stop.top,stop.right,stop.bottom], map: [map.left,map.top,map.right,map.bottom] }
+      })
+      assert(bounds.visible, `Destination should be visible near the end of mission ${number}: ${JSON.stringify(bounds)}`)
+    }
   }
   assert.match(await page.locator('.stage-result .stars').innerText(), /★★★★★/)
   await page.getByRole('button', { name: 'Next stage' }).click()
@@ -51,15 +65,32 @@ async function typeBoard(page) {
   }
 }
 
-async function playMouse(page) {
-  for (let i = 0; i < 6; i++) {
-    const target = page.locator('.marker-position.active button')
-    const action = (await target.getAttribute('aria-label')).replace(' target', '')
-    if (action === 'Right click') await target.click({ button: 'right' })
-    else if (action === 'Double click') await target.dblclick()
-    else if (action === 'Scroll down') await target.hover().then(() => page.mouse.wheel(0, 120))
-    else await target.click()
+async function race(page, number) {
+  assert.equal(await page.locator('.race-car').count(), 4)
+  assert(await page.locator('.race-near').evaluate(element => getComputedStyle(element).backgroundImage.includes('race-')))
+  if (number === 1) {
+    await page.clock.fastForward(91000)
+    await page.getByRole('heading', { name: 'The poachers got ahead!' }).waitFor()
+    assert.equal(await page.getByRole('button', { name: 'Next stage' }).count(), 0)
+    await page.getByRole('button', { name: 'Retry race' }).click()
+    assert.equal(await page.locator('.race-metrics').innerText().then(text => text.includes('0% to finish')), true)
+    await page.clock.runFor(12000)
+    assert(await page.locator('.rival-0').getAttribute('style').then(style => style !== 'left: 7%;'))
+    if (process.env.RACE_SCREENSHOT) await page.locator('.race-scene').screenshot({ path: process.env.RACE_SCREENSHOT })
+    await page.clock.resume()
+    await page.keyboard.type('x')
+    assert.equal(await page.locator('.race-metrics').innerText().then(text => text.includes('0% to finish')), true)
   }
+  const count = Number((await page.locator('.race-title span').innerText()).match(/\/ (\d+) WORDS/)?.[1])
+  assert(count > 30 && count < 60)
+  const initialPosition = await page.locator('.player-car').getAttribute('style')
+  for (let i = 0; i < count; i++) {
+    const word = (await page.locator('.race-words .active').innerText()).trim()
+    await page.keyboard.type(word + (i < count-1 ? ' ' : ''))
+    if (i === 0) assert.notEqual(await page.locator('.player-car').getAttribute('style'), initialPosition)
+  }
+  await page.getByRole('heading', { name: 'You won the race!' }).waitFor()
+  assert.match(await page.locator('.stage-result .stars').innerText(), /★★★★★/)
 }
 
 async function finishMission(page, number) {
@@ -69,14 +100,9 @@ async function finishMission(page, number) {
   await page.getByRole('button', { name: /Let's go to/ }).click()
   await page.getByRole('button', { name: 'Take off' }).click()
   await flyRoute(page, number)
-  await page.getByRole('button', { name: 'Start stage' }).click()
-  if ([3, 5, 9].includes(number)) await playMouse(page)
-  else if (number === 4) {
-    for (const direction of ['left', 'forward', 'right', 'forward', 'left', 'forward', 'right', 'forward']) {
-      await page.getByRole('button', { name: new RegExp(direction) }).last().click()
-      await page.keyboard.type(direction)
-    }
-  } else await typeBoard(page)
+  if (number === 1) await page.clock.install()
+  await page.getByRole('button', { name: 'Start race' }).click()
+  await race(page, number)
   await page.getByRole('button', { name: 'Next stage' }).click()
   await page.getByRole('button', { name: 'Start stage' }).click()
   await typeBoard(page)
@@ -109,7 +135,8 @@ try {
   assert.equal(await page.locator('.trophy-card:not(.empty)').count(), 10)
   assert(await page.locator('.trophy-figure img').first().evaluate(image => image.complete && image.naturalWidth > 0))
   assert(await page.evaluate(async () => (await fetch('/world-map.svg')).ok))
-  console.log('Smoke test passed: all 10 missions, map flight and crash/retry, stages, reports, persistence and offline assets.')
+  assert(await page.evaluate(async () => (await Promise.all(['/race-forest.svg','/race-mountains.svg','/race-shore.svg'].map(path => fetch(path)))).every(response => response.ok)))
+  console.log('Smoke test passed: all 10 missions, flight, race win/loss/retry, rescue, reports, persistence and offline assets.')
 } finally {
   await browser?.close()
   server.kill('SIGTERM')

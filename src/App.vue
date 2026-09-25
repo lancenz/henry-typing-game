@@ -5,6 +5,7 @@ import { animalImages } from './images'
 import { initDb, getResults, getTests, getReports, getSetting, setSetting, saveResult, saveTest, saveReport, type Result, type TestResult, type Report } from './db'
 import { checkReport, replyToReport, type Correction } from './ai'
 import { travelRoutes, travelWords, mapPoint } from './travel'
+import { raceWords, raceTerrain, rivalFinishTimes } from './race'
 
 type Page = 'base' | 'map' | 'mission' | 'shelf' | 'test' | 'settings'
 const page = ref<Page>('base')
@@ -45,28 +46,30 @@ const testCorrect = ref(0)
 const testMistakes = ref(0)
 const testTime = ref(60)
 const testOutcome = ref({ wpm: 0, accuracy: 0, score: 0, record: false })
-const mouseStep = ref(0)
-const mouseErrors = ref(0)
-const mousePrecision = ref(0)
 const selectedIndex = ref<number | null>(null)
 const clearedIndices = ref<number[]>([])
 const lastFlightKey = ref(0)
 const stallSeconds = ref(10)
-const droneDirection = ref('')
-const dronePosition = ref({ x: 50, y: 82 })
-const droneTrail = ref<{x:number,y:number}[]>([{x:50,y:82}])
+const raceElapsed = ref(0)
+const raceNow = ref(0)
+const boostUntil = ref(0)
+const rivalProgress = ref([0, 0, 0])
+const rivalHoldUntil = [0, 0, 0]
+const rivalNextHold = [0, 0, 0]
+let lastRaceTick = 0
 const gameInput = ref<HTMLInputElement | null>(null)
 const online = ref(navigator.onLine)
 let tick: ReturnType<typeof setInterval> | undefined
-let clickTimer: ReturnType<typeof setTimeout> | undefined
 
 const mission = computed(() => missions[missionIndex.value]!)
 const earned = computed(() => results.value.reduce((sum, r) => sum + r.gold, 0))
 const best = computed(() => Math.max(0, ...tests.value.map(t => t.score)))
 const completed = computed(() => new Set(reports.value.map(r => r.mission)))
 const unlocked = computed(() => Math.min(missions.length, completed.value.size + 1))
-const isDrone = computed(() => phase.value === 3 && mission.value.id === 4)
 const isRoute = computed(() => phase.value === 2)
+const isRace = computed(() => phase.value === 3)
+const playerDistance = computed(() => correct.value / Math.max(1, prompts.value.join(' ').length))
+const boosting = computed(() => raceNow.value < boostUntil.value)
 const flightStops = computed(() => travelRoutes[missionIndex.value]!.map(stop => ({ ...stop, ...mapPoint(stop) })))
 const flightProgress = computed(() => Math.min(1, (promptIndex.value + character.value / Math.max(1, currentPrompt.value.length)) / Math.max(1, prompts.value.length)))
 const flightPosition = computed(() => {
@@ -77,16 +80,24 @@ const flightPosition = computed(() => {
 })
 const routeLine = computed(() => flightStops.value.map(stop => `${stop.x},${stop.y}`).join(' '))
 const flownLine = computed(() => [...flightStops.value.slice(0, flightPosition.value.index + 1).map(stop => `${stop.x},${stop.y}`), `${flightPosition.value.x},${flightPosition.value.y}`].join(' '))
-const isBoard = computed(() => (phase.value === 3 || phase.value === 4) && !isMouse.value && !isDrone.value)
+const mapZoom = computed(() => missionIndex.value === 9 ? 3.6 : 2.35)
+const cameraStyle = computed(() => {
+  const plane = flightPosition.value
+  const ahead = flightStops.value[Math.min(plane.index + 1, flightStops.value.length - 1)]!
+  const focusX = (plane.x * .68 + ahead.x * .32) / 1000
+  const focusY = (plane.y * .7 + ahead.y * .3) / 520
+  const clamp = (value: number) => Math.max(1 - mapZoom.value, Math.min(0, value))
+  const x = clamp(.5 - mapZoom.value * focusX)
+  const y = clamp(.6 - mapZoom.value * focusY)
+  return { transform: `translate(${x * 100}%, ${y * 100}%) scale(${mapZoom.value})` }
+})
+const isBoard = computed(() => phase.value === 4)
 const boardKind = computed(() => ['vines','cameras','tracks','river','lake','radio','tracks','sonar','lookout','journal'][missionIndex.value] ?? 'tracks')
-const currentPrompt = computed(() => isDrone.value ? droneDirection.value : isBoard.value ? prompts.value[selectedIndex.value ?? -1] ?? '' : isRoute.value && promptIndex.value < prompts.value.length - 1 ? `${prompts.value[promptIndex.value]} ` : prompts.value[promptIndex.value] ?? '')
+const currentPrompt = computed(() => isBoard.value ? prompts.value[selectedIndex.value ?? -1] ?? '' : (isRoute.value || isRace.value) && promptIndex.value < prompts.value.length - 1 ? `${prompts.value[promptIndex.value]} ` : prompts.value[promptIndex.value] ?? '')
 const expected = computed(() => currentPrompt.value[character.value] ?? '')
-const isMouse = computed(() => phase.value === 3 && [3, 5, 9].includes(mission.value.id))
-const stageName = computed(() => phase.value === 2 ? 'Expedition route' : phase.value === 3 ? mission.value.mechanic : `Protect the ${mission.value.animal}`)
+const stageName = computed(() => phase.value === 2 ? 'Expedition route' : phase.value === 3 ? 'Race to the field site' : `Protect the ${mission.value.animal}`)
 const progress = computed(() => prompts.value.length ? Math.round((promptIndex.value / prompts.value.length) * 100) : 0)
 const accuracy = computed(() => correct.value + mistakes.value ? Math.round(100 * correct.value / (correct.value + mistakes.value)) : 100)
-const mouseActions = computed(() => mission.value.id === 5 ? ['Scroll down','Left click','Scroll down','Double click','Right click','Scroll down'] : mission.value.id === 9 ? ['Double click','Right click','Left click','Double click','Scroll down','Left click'] : ['Left click','Right click','Double click','Scroll down','Left click','Right click'])
-const mousePositions = [{x:23,y:38},{x:72,y:60},{x:49,y:27},{x:80,y:29},{x:35,y:68},{x:58,y:48}]
 const fingers: Record<string, string> = {
   '`':'Left pinky','1':'Left pinky','q':'Left pinky','a':'Left pinky','z':'Left pinky',
   '2':'Left ring','w':'Left ring','s':'Left ring','x':'Left ring',
@@ -108,7 +119,7 @@ onMounted(async () => {
   try { await initDb(); refresh(); apiKey.value = getSetting('key'); model.value = getSetting('model') || model.value; voice.value = getSetting('voice') !== 'off'; ready.value = true }
   catch (e) { error.value = `Could not open local game data: ${String(e)}` }
 })
-onUnmounted(() => { stopTick(); clearTimeout(clickTimer); speechSynthesis.cancel() })
+onUnmounted(() => { stopTick(); speechSynthesis.cancel() })
 function stopTick() { if (tick) clearInterval(tick); tick = undefined }
 function speak(text: string) {
   if (!voice.value || !('speechSynthesis' in window)) return
@@ -135,62 +146,76 @@ function nextPhase() {
 }
 function stagePrompts(): string[] {
   if (phase.value === 2) return travelWords(missionIndex.value)
-  if (phase.value === 3 && mission.value.id === 4) return Array(8).fill('direction')
-  if (phase.value === 3) return mission.value.words.slice(2, 8)
+  if (phase.value === 3) return raceWords(missionIndex.value)
   return mission.value.id >= 7 ? mission.value.sentences : [...mission.value.words.slice(4), ...mission.value.sentences.slice(0, 1)]
 }
 function startStage() {
   prompts.value = stagePrompts(); promptIndex.value = 0; character.value = 0; mistakes.value = 0; correct.value = 0
-  mouseStep.value = 0; mouseErrors.value = 0; mousePrecision.value = 0; failed.value = false; finished.value = false; feedback.value = ''
-  selectedIndex.value = null; clearedIndices.value = []; droneDirection.value = ''
-  dronePosition.value = {x:50,y:82}; droneTrail.value = [{x:50,y:82}]
+  failed.value = false; finished.value = false; feedback.value = ''
+  selectedIndex.value = null; clearedIndices.value = []
+  rivalProgress.value = [0, 0, 0]; rivalHoldUntil.fill(0); rivalNextHold.fill(0); raceElapsed.value = 0; boostUntil.value = 0
   const letters = prompts.value.join(' ').length
-  duration.value = isRoute.value ? 150 : isMouse.value ? 90 : isDrone.value ? 110 : Math.max(55, Math.ceil((letters / 5) / (5 + mission.value.id * 2.5) * 60 * 2.1 + 25))
-  seconds.value = duration.value; started.value = Date.now(); lastFlightKey.value = started.value; stallSeconds.value = 10; playing.value = true
+  duration.value = isRoute.value ? 150 : isRace.value ? 90 : Math.max(55, Math.ceil((letters / 5) / (5 + mission.value.id * 2.5) * 60 * 2.1 + 25))
+  seconds.value = duration.value; started.value = Date.now(); lastRaceTick = started.value; raceNow.value = started.value; lastFlightKey.value = started.value; stallSeconds.value = 10; playing.value = true
   tick = setInterval(() => {
-    seconds.value = Math.max(0, duration.value - Math.floor((Date.now() - started.value) / 1000))
-    if (isRoute.value) stallSeconds.value = Math.max(0, 10 - Math.floor((Date.now() - lastFlightKey.value) / 1000))
+    const now = Date.now()
+    seconds.value = Math.max(0, duration.value - Math.floor((now - started.value) / 1000))
+    if (isRoute.value) stallSeconds.value = Math.max(0, 10 - Math.floor((now - lastFlightKey.value) / 1000))
+    if (isRace.value) updateRivals(now)
     if (seconds.value === 0 || (isRoute.value && stallSeconds.value === 0)) void endStage(true)
-  }, 200)
-  if (!isMouse.value) void nextTick(() => gameInput.value?.focus())
+  }, 100)
+  void nextTick(() => gameInput.value?.focus())
+}
+function updateRivals(now: number) {
+  const delta = Math.min(.25, (now - lastRaceTick) / 1000)
+  lastRaceTick = now; raceNow.value = now
+  raceElapsed.value = Math.max(0, (now - started.value) / 1000)
+  rivalProgress.value = rivalProgress.value.map((position, i) => {
+    const finish = rivalFinishTimes[i]!
+    const target = Math.min(1, raceElapsed.value / finish)
+    // Rivals briefly brake when far ahead; in the final stretch they recover
+    // their scheduled 91/100/110-second finish pace instead of drifting away.
+    if (raceElapsed.value < finish - 8 && target > playerDistance.value + .22 && now >= rivalNextHold[i]!) {
+      rivalHoldUntil[i] = now + 1200 + i * 250
+      rivalNextHold[i] = now + 4500 + i * 300
+    }
+    if (now < rivalHoldUntil[i]! && raceElapsed.value < finish - 8) return position
+    if (raceElapsed.value >= finish - 8) return Math.min(1, position + (1 - position) * delta / Math.max(.1, finish - raceElapsed.value))
+    return Math.min(target, position + delta * Math.max(1 / finish, (target - position) * .6))
+  })
 }
 async function endStage(timeout = false) {
   if (!playing.value) return
   stopTick(); playing.value = false
-  const miss = isMouse.value ? mouseErrors.value : mistakes.value
-  const hits = isMouse.value ? mouseStep.value : correct.value
+  const miss = mistakes.value
+  const hits = correct.value
   const acc = hits + miss ? hits / (hits + miss) : 0
   const elapsed = Math.max(1, (Date.now() - started.value) / 1000)
-  const wpm = isMouse.value ? 0 : Math.round((hits / 5) / (elapsed / 60))
-  failed.value = timeout || (phase.value === 4 && miss >= 4) || (isMouse.value && miss >= 4)
-  if (failed.value) { feedback.value = isRoute.value ? seconds.value === 0 ? 'The flight ran out of time and the plane crashed. Restart from Auckland!' : 'The plane stalled and crashed. Keep typing to stay in the air!' : timeout ? 'Time is up. Take a breath and try again!' : 'The equipment needs a reset. Try again with steady hands!'; return }
-  const stars = isRoute.value ? Math.max(1, Math.min(5, Math.floor(wpm * acc / 6))) : Math.max(1, Math.min(5, Math.round(acc * 3 + (seconds.value / duration.value) * 2)))
-  const gold = stars * 10 + Math.round(acc * 10) + (isMouse.value ? mousePrecision.value : 0)
+  const wpm = Math.round((hits / 5) / (elapsed / 60))
+  failed.value = timeout || (isRace.value && elapsed >= 90) || (phase.value === 4 && miss >= 4)
+  if (failed.value) { feedback.value = isRace.value ? 'The poachers are almost at the finish! Reach it within 90 seconds to win. Your next try starts at the line.' : isRoute.value ? seconds.value === 0 ? 'The flight ran out of time and the plane crashed. Restart from Auckland!' : 'The plane stalled and crashed. Keep typing to stay in the air!' : timeout ? 'Time is up. Take a breath and try again!' : 'The equipment needs a reset. Try again with steady hands!'; return }
+  const stars = isRoute.value || isRace.value ? Math.max(1, Math.min(5, Math.floor(wpm * acc / 6))) : Math.max(1, Math.min(5, Math.round(acc * 3 + (seconds.value / duration.value) * 2)))
+  const gold = stars * 10 + Math.round(acc * 10)
   outcome.value = { stars, gold, wpm, accuracy: Math.round(acc * 100) }
   try { await saveResult(mission.value.id, `stage-${phase.value}`, stars, gold, outcome.value.accuracy, wpm); refresh() }
   catch (e) { error.value = `Could not save the result: ${String(e)}` }
   finished.value = true; speak('Great work, Henry!')
 }
 function typeKey(key: string) {
-  if (!playing.value || isMouse.value || !currentPrompt.value || key.length !== 1) return
+  if (!playing.value || !currentPrompt.value || key.length !== 1) return
    if (key === expected.value) {
      correct.value++; character.value++; feedback.value = ''
      if (isRoute.value) { lastFlightKey.value = Date.now(); stallSeconds.value = 10 }
+     if (isRace.value) { boostUntil.value = Date.now() + 300; raceNow.value = Date.now() }
     if (character.value >= currentPrompt.value.length) {
       if (isBoard.value && selectedIndex.value !== null) { clearedIndices.value.push(selectedIndex.value); selectedIndex.value = null }
-      if (isDrone.value) {
-        const last = dronePosition.value
-        const next = { x: Math.max(9, Math.min(91, last.x + (droneDirection.value === 'left' ? -18 : droneDirection.value === 'right' ? 18 : 0))), y: Math.max(12, last.y - 9) }
-        dronePosition.value = next; droneTrail.value.push(next); droneDirection.value = ''
-      }
-      promptIndex.value++; character.value = 0
-      if (promptIndex.value >= prompts.value.length) void endStage()
-      else if (!isBoard.value && !isRoute.value && !isDrone.value) sayPrompt()
+       promptIndex.value++; character.value = 0
+       if (promptIndex.value >= prompts.value.length) void endStage()
     }
   } else {
     mistakes.value++
     feedback.value = `Try ${expected.value === ' ' ? 'Space' : expected.value.toUpperCase()} again. Stay on this letter.`
-    speak(expected.value === ' ' ? 'space' : expected.value.toUpperCase())
+    if (!isRace.value) speak(expected.value === ' ' ? 'space' : expected.value.toUpperCase())
     if (phase.value === 4 && mistakes.value >= 4) void endStage()
   }
 }
@@ -206,14 +231,8 @@ function pickBoard(index: number) {
   selectedIndex.value = index; character.value = 0; feedback.value = 'Clue selected. Type it to complete the action.'
   sayPrompt(); void nextTick(() => gameInput.value?.focus())
 }
-function chooseDirection(direction: string) {
-  if (!playing.value || !isDrone.value) return
-  if (droneDirection.value && character.value > 0) { feedback.value = 'Finish typing this direction before turning.'; return }
-  droneDirection.value = direction; character.value = 0; feedback.value = `Type ${direction} to fly the drone.`
-  sayPrompt(); void nextTick(() => gameInput.value?.focus())
-}
 function keydown(event: KeyboardEvent) {
-  if (page.value === 'mission' && playing.value && !isMouse.value) {
+  if (page.value === 'mission' && playing.value) {
     if (event.key === 'Tab' || event.key === 'Escape' || event.ctrlKey || event.metaKey || event.altKey) return
     if (event.key.length === 1 || event.key === 'Backspace') { event.preventDefault(); typeKey(event.key) }
   } else if (page.value === 'test' && testPlaying.value) {
@@ -224,25 +243,6 @@ function keydown(event: KeyboardEvent) {
 onMounted(() => { window.addEventListener('keydown', keydown); window.addEventListener('online', updateOnline); window.addEventListener('offline', updateOnline) })
 onUnmounted(() => { window.removeEventListener('keydown', keydown); window.removeEventListener('online', updateOnline); window.removeEventListener('offline', updateOnline) })
 function updateOnline() { online.value = navigator.onLine }
-function mouseAction(action: string, event?: MouseEvent | WheelEvent) {
-  if (!playing.value || !isMouse.value) return
-  if (mouseActions.value[mouseStep.value] === action) {
-    if (event) {
-      const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect()
-      const distance = Math.hypot(event.clientX - (bounds.left + bounds.width / 2), event.clientY - (bounds.top + bounds.height / 2))
-      mousePrecision.value += Math.max(0, Math.round(5 * (1 - distance / (bounds.width / 2))))
-    }
-    mouseStep.value++; feedback.value = 'Nice observation!'
-    if (mouseStep.value === mouseActions.value.length) void endStage()
-  } else { mouseErrors.value++; feedback.value = `This marker needs: ${mouseActions.value[mouseStep.value]}`; if (mouseErrors.value >= 4) void endStage() }
-}
-function targetClick(event: MouseEvent) {
-  if (event.detail > 1) { clearTimeout(clickTimer); mouseAction('Double click', event) }
-  else if (mouseActions.value[mouseStep.value] === 'Double click') {
-    clearTimeout(clickTimer)
-    clickTimer = setTimeout(() => { if (playing.value && mouseActions.value[mouseStep.value] === 'Double click') mouseAction('Left click') }, 330)
-  } else mouseAction('Left click', event)
-}
 function startTest() {
   testText.value = Array(5).fill(testTexts[tests.value.length % testTexts.length]!).join(' '); testCursor.value = 0; testCorrect.value = 0; testMistakes.value = 0
   testTime.value = 60; testDone.value = false; testPlaying.value = true; started.value = Date.now()
@@ -339,21 +339,22 @@ function licenseUrl(license: string) {
         <div class="stepper"><div v-for="(label,i) in ['Briefing','Lesson','Travel','Fieldwork','Rescue','Report']" :key="label" :class="{current:phase===i,passed:phase>i}"><span>{{ phase>i ? '✓' : i+1 }}</span>{{ label }}</div></div>
         <template v-if="phase===0"><div class="paper-card brief-card"><div class="eyebrow">✉ &nbsp; INCOMING FIELD MESSAGE</div><h2>Message from your expedition guide</h2><p class="quote">“{{ mission.brief }}”</p><div class="signoff">Adventure awaits, <b>Forrest-inspired guide ✳</b></div></div><div class="fact-strip"><span>ⓘ</span><p><b>Real-world field note:</b> {{ mission.fact }}</p></div><button class="primary-btn" @click="nextPhase">Open your field lesson <span>→</span></button></template>
         <template v-else-if="phase===1"><div class="paper-card lesson-card"><div class="eyebrow">KEYBOARD FIELD GUIDE</div><h2>{{ mission.focus }}</h2><p>{{ mission.tip }}</p><div class="lesson-columns"><div><h3>Before you begin</h3><ul><li>Rest your fingers on <b>A S D F</b> and <b>J K L ;</b>.</li><li>Feel the little bumps on <b>F</b> and <b>J</b>.</li><li>Look at the screen, not down at the keys.</li><li>Type with the suggested finger. Mistakes never skip a letter.</li></ul></div><div class="lesson-example"><small>YOU'LL PRACTICE</small><div>{{ mission.words.slice(1,5).join(' · ') }}</div><span>Real words. Real clues. Your pace.</span></div></div></div><button class="primary-btn" @click="nextPhase">Let's go to {{ mission.region }} <span>→</span></button></template>
-        <template v-else-if="phase>=2 && phase<=4"><div class="game-layout" :class="{'travel-layout':isRoute}"><div class="game-main"><div class="paper-card game-card"><div class="game-top"><div><div class="eyebrow">STAGE {{ phase-1 }} OF 3 · {{ phase===2?'TRAVEL':phase===3?'FIELDWORK':'RESCUE' }}</div><h2>{{ stageName }}</h2></div><div v-if="playing" class="timer" :class="{urgent:seconds<12}">◷ {{ seconds }}s</div></div><p v-if="!playing && !finished && !failed" class="game-instruction">{{ phase===2 ? `Fly from Auckland to ${mission.place}. Type the words in order to draw your flight path. Keep typing: after 10 seconds without a correct key the plane crashes! You have 2½ minutes. Five stars starts at 30 WPM × accuracy.` : phase===3 ? mission.challenge : `Choose the clues and complete each rescue task. Four mistakes will reset your tools.` }}</p><div v-if="!playing && !finished && !failed" class="preflight"><span>⌨</span><div><b>Ready when you are.</b><small>{{ isRoute ? '60 familiar words · Space between words · 30 adjusted WPM for ★★★★★' : `Target pace: ${5+mission.id*2.5} WPM · ${phase===4?'4 tool strikes available':'Accuracy first'}` }}</small></div><button class="primary-btn" @click="startStage">{{ isRoute?'Take off →':'Start stage →' }}</button></div>
-           <template v-if="(playing || failed && isRoute) && !isMouse">
-             <div v-if="isRoute" class="flight-map" :class="{crashed:failed}" role="group" :aria-label="`Flight from Auckland to ${mission.place}; ${Math.round(flightProgress*100)} percent complete`">
-               <div class="flight-overlay"><div class="flight-heading">✈ AUCKLAND → {{ mission.place.toUpperCase() }} <span>WORD {{ Math.min(promptIndex+1,prompts.length) }} / {{ prompts.length }}</span></div><div v-if="failed" class="flight-mayday">MAYDAY! FLIGHT INTERRUPTED</div><template v-else><div class="flight-words" aria-label="Words to type"><span v-for="(word,i) in prompts.slice(Math.max(0,promptIndex-1),promptIndex+6)" :key="Math.max(0,promptIndex-1)+i" :class="{past:Math.max(0,promptIndex-1)+i<promptIndex,active:Math.max(0,promptIndex-1)+i===promptIndex}"><template v-if="Math.max(0,promptIndex-1)+i===promptIndex"><b>{{ word.slice(0,character) }}</b><em>{{ expected===' ' ? '␣' : expected }}</em>{{ word.slice(Math.min(character+1,word.length)) }}</template><template v-else>{{ word }}</template></span></div><div class="flight-stats">{{ accuracy }}% accuracy · {{ mistakes }} misses <strong :class="{urgent:stallSeconds<=3}">✈ AIR: {{ stallSeconds }}s</strong></div></template></div>
-               <svg class="flight-routes" viewBox="0 0 1000 520" preserveAspectRatio="none" aria-hidden="true"><polyline class="flight-upcoming" :points="routeLine"/><polyline class="flight-flown" :points="flownLine"/></svg>
-               <div v-for="(stop,i) in flightStops" :key="i" class="flight-stop" :class="{visited:flightProgress >= i/(flightStops.length-1),destination:i===flightStops.length-1}" :style="{left:stop.x/10+'%',top:stop.y/5.2+'%'}"><span class="flight-dot"></span><span class="flight-label">{{ stop.name }}</span></div>
-               <div class="flight-plane" :style="{left:flightPosition.x/10+'%',top:flightPosition.y/5.2+'%',transform:`translate(-50%,-50%) rotate(${flightPosition.angle}deg)`}"><svg viewBox="-22 -18 44 36" aria-hidden="true"><path d="M-17-12 19 0-17 12-9 2-20 0-9-2Z"/></svg></div>
-               <div class="flight-cartouche">THE WILD TYPE · WORLD EXPEDITION</div>
+        <template v-else-if="phase>=2 && phase<=4"><div class="game-layout" :class="{'travel-layout':isRoute,'race-layout':isRace}"><div class="game-main"><div class="paper-card game-card"><div class="game-top"><div><div class="eyebrow">STAGE {{ phase-1 }} OF 3 · {{ phase===2?'TRAVEL':phase===3?'FIELDWORK':'RESCUE' }}</div><h2>{{ stageName }}</h2></div><div v-if="playing" class="timer" :class="{urgent:seconds<12}">◷ {{ seconds }}s</div></div><p v-if="!playing && !finished && !failed" class="game-instruction">{{ isRoute ? `Fly from Auckland to ${mission.place}. Type the words in order to draw your flight path. Keep typing: after 10 seconds without a correct key the plane crashes! You have 2½ minutes. Five stars starts at 30 WPM × accuracy.` : isRace ? `Race three poacher vehicles to the field site through ${mission.habitat.toLowerCase()} country. Each correct key boosts your car; mistakes cost time, but you can catch up. Finish within 90 seconds to win and continue.` : `Choose the clues and complete each rescue task. Four mistakes will reset your tools.` }}</p><div v-if="!playing && !finished && !failed" class="preflight"><span>⌨</span><div><b>Ready when you are.</b><small>{{ isRoute ? '60 familiar words · Space between words · 30 adjusted WPM for ★★★★★' : isRace ? 'Space between words · Rivals finish at 91s, 100s, 110s · 30 adjusted WPM for ★★★★★' : `Target pace: ${5+mission.id*2.5} WPM · 4 tool strikes available` }}</small></div><button class="primary-btn" @click="startStage">{{ isRoute?'Take off →':isRace?'Start race →':'Start stage →' }}</button></div>
+           <template v-if="playing || (failed && (isRoute || isRace)) || (finished && isRace)">
+              <div v-if="isRoute" class="flight-map" :class="{crashed:failed}" role="group" :aria-label="`Flight from Auckland to ${mission.place}; ${Math.round(flightProgress*100)} percent complete`">
+                <div class="flight-world" :style="cameraStyle">
+                  <svg class="flight-routes" viewBox="0 0 1000 520" preserveAspectRatio="none" aria-hidden="true"><polyline class="flight-upcoming" :points="routeLine" vector-effect="non-scaling-stroke"/><polyline class="flight-flown" :points="flownLine" vector-effect="non-scaling-stroke"/></svg>
+                  <div v-for="(stop,i) in flightStops" :key="i" class="flight-stop" :class="{visited:flightProgress >= i/(flightStops.length-1),destination:i===flightStops.length-1}" :style="{left:stop.x/10+'%',top:stop.y/5.2+'%',transform:`translate(-50%,-50%) scale(${1/mapZoom})`}"><span class="flight-dot"></span><span class="flight-label">{{ stop.name }}</span></div>
+                  <div class="flight-plane" :style="{left:flightPosition.x/10+'%',top:flightPosition.y/5.2+'%',transform:`translate(-50%,-50%) rotate(${flightPosition.angle}deg) scale(${1/mapZoom})`}"><svg viewBox="-22 -18 44 36" aria-hidden="true"><path d="M-17-12 19 0-17 12-9 2-20 0-9-2Z"/></svg></div>
+                </div>
+                <div class="flight-overlay"><div class="flight-heading">✈ AUCKLAND → {{ mission.place.toUpperCase() }} <span>WORD {{ Math.min(promptIndex+1,prompts.length) }} / {{ prompts.length }}</span></div><div v-if="failed" class="flight-mayday">MAYDAY! FLIGHT INTERRUPTED</div><template v-else><div class="flight-words" aria-label="Words to type"><span v-for="(word,i) in prompts.slice(Math.max(0,promptIndex-1),promptIndex+6)" :key="Math.max(0,promptIndex-1)+i" :class="{past:Math.max(0,promptIndex-1)+i<promptIndex,active:Math.max(0,promptIndex-1)+i===promptIndex}"><template v-if="Math.max(0,promptIndex-1)+i===promptIndex"><b>{{ word.slice(0,character) }}</b><em>{{ expected===' ' ? '␣' : expected }}</em>{{ word.slice(Math.min(character+1,word.length)) }}</template><template v-else>{{ word }}</template></span></div><div class="flight-stats">{{ accuracy }}% accuracy · {{ mistakes }} misses <strong :class="{urgent:stallSeconds<=3}">✈ AIR: {{ stallSeconds }}s</strong></div></template></div>
+                <div class="flight-cartouche">THE WILD TYPE · WORLD EXPEDITION</div>
              </div>
-            <div v-else-if="isDrone" class="drone-scene">
-              <div class="scene-title">LIVE DRONE FEED <span>{{ promptIndex }} / {{ prompts.length }} MOVES</span></div>
-              <div class="drone-grid"><div v-for="(point,i) in droneTrail" :key="i" class="drone-trace" :style="{left:point.x+'%',top:point.y+'%'}"></div><div class="drone-marker" :style="{left:dronePosition.x+'%',top:dronePosition.y+'%'}">✣</div><div class="drone-scan">RIVERBANK SCAN</div></div>
-              <p>Choose any direction. Type it to fly one step. Every flight move counts.</p>
-              <div class="direction-controls"><button v-for="direction in ['left','forward','right']" :key="direction" :class="{picked:droneDirection===direction}" @click="chooseDirection(direction)">{{ direction==='left'?'←':direction==='right'?'→':'↑' }} {{ direction }}</button></div>
-            </div>
+             <div v-else-if="isRace" class="race-scene" :class="[`terrain-${raceTerrain[missionIndex]}`,{lost:failed,won:finished,boosting:boosting && playing}]" role="group" :aria-label="`Race through ${mission.habitat}; you are ${Math.round(playerDistance*100)} percent of the way to the finish`">
+               <div class="race-sky"><div class="race-sun"></div><div class="race-far"></div><div class="race-near"></div><span class="race-place">{{ mission.habitat.toUpperCase() }} · {{ mission.region.toUpperCase() }}</span></div>
+               <div class="race-track"><div class="race-finish-line"><span>FINISH</span></div><div v-for="(rival,i) in rivalProgress" :key="i" class="race-lane"><span class="lane-label">{{ ['RED','BLUE','GOLD'][i] }} · {{ rivalFinishTimes[i] }}s</span><div class="race-car" :class="`rival-${i}`" :style="{left:`${7+rival*83}%`}"><div class="race-driver"><i></i><span></span></div><div class="race-body"><span class="race-wheel"></span><span class="race-wheel"></span></div><small>POACHER {{ i+1 }}</small></div></div><div class="race-lane player-lane"><span class="lane-label">HENRY · YOU</span><div class="race-car player-car" :class="{boost:boosting && playing}" :style="{left:`${7+playerDistance*83}%`}"><div class="race-driver"><i></i><span></span></div><div class="race-body"><span class="race-wheel"></span><span class="race-wheel"></span></div><small>HENRY</small></div></div></div>
+               <div class="race-hud"><div class="race-title">{{ finished?'FINISH LINE · HENRY WINS!':failed?'RACE OVER · TRY AGAIN':'TYPE TO BOOST · BEAT 90 SECONDS' }} <span>{{ Math.min(promptIndex+1,prompts.length) }} / {{ prompts.length }} WORDS</span></div><div v-if="playing" class="race-words" aria-label="Words to type"><span v-for="(word,i) in prompts.slice(Math.max(0,promptIndex-1),promptIndex+6)" :key="Math.max(0,promptIndex-1)+i" :class="{past:Math.max(0,promptIndex-1)+i<promptIndex,active:Math.max(0,promptIndex-1)+i===promptIndex}"><template v-if="Math.max(0,promptIndex-1)+i===promptIndex"><b>{{ word.slice(0,character) }}</b><em>{{ expected===' '?'␣':expected }}</em>{{ word.slice(Math.min(character+1,word.length)) }}</template><template v-else>{{ word }}</template></span></div><div v-else class="race-words" :class="{'race-words-lost':failed}">{{ failed?'THE POACHERS ARE CLOSING IN':'YOU MADE IT TO THE FIELD SITE!' }}</div><div class="race-metrics">{{ Math.round(playerDistance*100) }}% to finish · {{ accuracy }}% accuracy · {{ mistakes }} misses <strong>{{ Math.floor(raceElapsed) }} / 90s</strong></div></div>
+             </div>
             <div v-else-if="isBoard" class="field-scene" :class="`scene-${boardKind}`">
               <div class="scene-title">{{ boardKind==='vines'?'VINE BARRIER':boardKind==='cameras'?'CAMERA TRAP NETWORK':boardKind==='radio'?'RADIO SIGNAL DESK':boardKind==='sonar'?'SONAR SCAN':boardKind==='journal'?'EXPEDITION JOURNAL':boardKind==='lake'?'LAKE OBSERVATION POSTS':boardKind==='lookout'?'BAYOU LOOKOUT':'TRACKING GRID' }} <span>{{ clearedIndices.length }} / {{ prompts.length }} CLEAR</span></div>
               <p>{{ boardKind==='vines'?'Choose a vine and type its word to cut it.':boardKind==='cameras'?'Log each camera station by typing its clue. The archive specimen image is for reference, not new footage.':boardKind==='radio'?`Find and tune the next signal: ${prompts[promptIndex]}.`:boardKind==='sonar'?'Choose a sonar echo and type its label to identify it.':boardKind==='journal'?`Reassemble the journal in order: find page ${promptIndex+1}.`:'Choose a field marker and record its clue.' }}</p>
@@ -361,14 +362,13 @@ function licenseUrl(license: string) {
                 <button v-for="(word,i) in prompts" :key="i" :class="{cleared:clearedIndices.includes(i),selected:selectedIndex===i}" :disabled="clearedIndices.includes(i)" @click="pickBoard(i)"><img v-if="boardKind==='cameras'" class="camera-image" :src="animalImages[missionIndex]!.src" alt=""/><span class="field-symbol">{{ boardKind==='vines'?'╱':boardKind==='cameras'?'▣':boardKind==='radio'?'⌁':boardKind==='sonar'?'◎':boardKind==='journal'?'▤':boardKind==='lake'?'◉':boardKind==='lookout'?'♧':'❖' }}</span><span class="field-word">{{ word }}</span><small>{{ clearedIndices.includes(i)?boardKind==='cameras'?'ARCHIVE REFERENCE':'COMPLETE':boardKind==='vines'?'CUT THIS VINE':boardKind==='journal'?`PAGE ${i+1}`:'SELECT CLUE' }}</small></button>
               </div>
             </div>
-             <div v-if="playing && !isRoute" class="game-progress"><span>{{ isDrone?'FLIGHT':'CLUES' }} {{ promptIndex }} / {{ prompts.length }}</span><span>{{ progress }}% COMPLETE</span></div><div v-if="playing && !isRoute" class="progress-track"><div :style="{width:progress+'%'}"></div></div>
-             <div v-if="!isRoute && currentPrompt" class="typing-prompt" aria-label="Text to type"><span class="typed">{{ currentPrompt.slice(0,character) }}</span><span class="cursor-letter">{{ expected === ' ' ? '␣' : expected }}</span><span>{{ currentPrompt.slice(character+1) }}</span></div>
-             <div v-else-if="!isRoute" class="awaiting-prompt">{{ isDrone?'Choose LEFT, FORWARD or RIGHT':'Choose a clue above to begin typing' }} ↑</div>
-             <p v-if="playing && !isRoute" class="game-hint">{{ accuracy }}% accuracy · {{ mistakes }} mistakes {{ phase===4?`· Tool strength ${Math.max(0,4-mistakes)}/4`:'' }}</p><div v-if="playing" class="feedback" aria-live="polite">{{ feedback || (isRoute ? 'Type the highlighted word and press Space. Keep the plane in the air!' : 'Choose an action, then type the highlighted letters. Wrong keys stay on the same letter.') }}</div><input v-if="playing" ref="gameInput" class="capture-input" aria-label="Type the highlighted text here" autocomplete="off" spellcheck="false" @input="($event.target as HTMLInputElement).value=''" /><button v-if="playing && !isRoute && currentPrompt && !currentPrompt.includes(' ')" class="audio-btn" @click="sayPrompt">◖)) Hear word and spelling</button>
-          </template>
-          <template v-if="playing && isMouse"><div class="scene-title">{{ mission.id===3?'TORTOISE TRAIL MARKERS':mission.id===5?'LAKE SURVEY STATIONS':'BAYOU OBSERVATION POSTS' }} <span>{{ mouseStep }} / {{ mouseActions.length }} CHECKED</span></div><div class="mouse-field" :class="`mouse-mission-${mission.id}`" @contextmenu.prevent><div class="field-grid"></div><div v-for="(position,i) in mousePositions" :key="i" class="marker-position" :class="{done:i<mouseStep,active:i===mouseStep}" :style="{left:position.x+'%',top:position.y+'%'}"><button v-if="i===mouseStep" class="field-target" :aria-label="mouseActions[i]+' target'" @click="targetClick" @contextmenu.prevent="mouseAction('Right click',$event)" @wheel.prevent="mouseAction('Scroll down',$event)"><span>◎</span></button><span v-else>{{ i<mouseStep?'✓':'?' }}</span></div></div><p class="mouse-command">{{ mouseActions[mouseStep] }} marker {{ mouseStep+1 }} <small>Closer to the center earns more gold · {{ mouseErrors }} misses · {{ mousePrecision }} precision gold</small></p><div class="feedback" aria-live="polite">{{ feedback || 'Use the mouse action shown above. Markers stay in place as you check them.' }}</div></template>
-           <div v-if="failed" class="stage-result"><span class="result-symbol">↺</span><h3>{{ isRoute?'Flight crashed!':'Let’s try that again.' }}</h3><p>{{ feedback }}</p><button class="primary-btn" @click="startStage">{{ isRoute?'Fly again from Auckland →':'Restart stage →' }}</button></div><div v-if="finished" class="stage-result"><span class="result-symbol">✦</span><h3>{{ isRoute?'Touchdown, Henry!':'Trail complete, Henry!' }}</h3><div class="stars">{{ '★'.repeat(outcome.stars) }}{{ '☆'.repeat(5-outcome.stars) }}</div><p>{{ outcome.accuracy }}% accuracy <span v-if="!isMouse">· {{ outcome.wpm }} WPM</span><span v-if="isRoute"> · {{ Math.round(outcome.wpm*outcome.accuracy/100) }} adjusted WPM</span> · +{{ outcome.gold }} gold</p><button class="primary-btn" @click="nextPhase">{{ phase===4?'Write your field report':'Next stage' }} →</button></div></div></div>
-          <aside class="game-aside"><div class="keyboard-card"><div class="eyebrow">FINGER GUIDE</div><h3>{{ playing && !isMouse ? (expected===' '?'Space bar':shownKey) : 'Home row' }}</h3><p>{{ playing && !isMouse ? finger : 'Find F and J without looking down.' }} <span v-if="playing && !isMouse && expected!==expected.toLowerCase()">· Hold opposite Shift</span></p><div class="split-keyboard"><div class="key-half" v-for="(half,hi) in [leftKeys,rightKeys]" :key="hi"><div v-for="(row,ri) in half" :key="ri" class="key-row"><span v-for="key in row" :key="key" :class="{lit:playing && key===shownKey,home:['A','S','D','F','J','K','L',';'].includes(key)}">{{ key }}</span></div></div></div><div class="space-key" :class="{lit:playing && expected===' '}">SPACE · thumbs</div><div class="finger-legend"><span>● pinky</span><span>● ring</span><span>● middle</span><span>● index</span></div></div><div class="tip-card compact"><div class="tip-symbol">✳</div><div><div class="eyebrow">FIELD REMINDER</div><p>Eyes on the screen. Fingers on the home row. Every accurate key counts.</p></div></div></aside></div></template>
+              <div v-if="playing && isBoard" class="game-progress"><span>CLUES {{ promptIndex }} / {{ prompts.length }}</span><span>{{ progress }}% COMPLETE</span></div><div v-if="playing && isBoard" class="progress-track"><div :style="{width:progress+'%'}"></div></div>
+              <div v-if="isBoard && currentPrompt" class="typing-prompt" aria-label="Text to type"><span class="typed">{{ currentPrompt.slice(0,character) }}</span><span class="cursor-letter">{{ expected === ' ' ? '␣' : expected }}</span><span>{{ currentPrompt.slice(character+1) }}</span></div>
+              <div v-else-if="isBoard" class="awaiting-prompt">Choose a clue above to begin typing ↑</div>
+              <p v-if="playing && isBoard" class="game-hint">{{ accuracy }}% accuracy · {{ mistakes }} mistakes · Tool strength {{ Math.max(0,4-mistakes) }}/4</p><div v-if="playing" class="feedback" aria-live="polite">{{ feedback || (isRoute ? 'Type the highlighted word and press Space. Keep the plane in the air!' : isRace ? 'Every correct key gives your car a boost. Keep going!' : 'Choose an action, then type the highlighted letters. Wrong keys stay on the same letter.') }}</div><input v-if="playing" ref="gameInput" class="capture-input" aria-label="Type the highlighted text here" autocomplete="off" spellcheck="false" @input="($event.target as HTMLInputElement).value=''" /><button v-if="playing && isBoard && currentPrompt && !currentPrompt.includes(' ')" class="audio-btn" @click="sayPrompt">◖)) Hear word and spelling</button>
+           </template>
+           <div v-if="failed" class="stage-result"><span class="result-symbol">↺</span><h3>{{ isRoute?'Flight crashed!':isRace?'The poachers got ahead!':'Let’s try that again.' }}</h3><p>{{ feedback }}</p><button class="primary-btn" @click="startStage">{{ isRoute?'Fly again from Auckland →':isRace?'Retry race →':'Restart stage →' }}</button></div><div v-if="finished" class="stage-result"><span class="result-symbol">✦</span><h3>{{ isRoute?'Touchdown, Henry!':isRace?'You won the race!':'Trail complete, Henry!' }}</h3><div class="stars">{{ '★'.repeat(outcome.stars) }}{{ '☆'.repeat(5-outcome.stars) }}</div><p>{{ outcome.accuracy }}% accuracy · {{ outcome.wpm }} WPM<span v-if="isRoute || isRace"> · {{ Math.round(outcome.wpm*outcome.accuracy/100) }} adjusted WPM</span> · +{{ outcome.gold }} gold</p><button class="primary-btn" @click="nextPhase">{{ phase===4?'Write your field report':'Next stage' }} →</button></div></div></div>
+           <aside class="game-aside"><div class="keyboard-card"><div class="eyebrow">FINGER GUIDE</div><h3>{{ playing ? (expected===' '?'Space bar':shownKey) : 'Home row' }}</h3><p>{{ playing ? finger : 'Find F and J without looking down.' }} <span v-if="playing && expected!==expected.toLowerCase()">· Hold opposite Shift</span></p><div class="split-keyboard"><div class="key-half" v-for="(half,hi) in [leftKeys,rightKeys]" :key="hi"><div v-for="(row,ri) in half" :key="ri" class="key-row"><span v-for="key in row" :key="key" :class="{lit:playing && key===shownKey,home:['A','S','D','F','J','K','L',';'].includes(key)}">{{ key }}</span></div></div></div><div class="space-key" :class="{lit:playing && expected===' '}">SPACE · thumbs</div><div class="finger-legend"><span>● pinky</span><span>● ring</span><span>● middle</span><span>● index</span></div></div><div class="tip-card compact"><div class="tip-symbol">✳</div><div><div class="eyebrow">FIELD REMINDER</div><p>Eyes on the screen. Fingers on the home row. Every accurate key counts.</p></div></div></aside></div></template>
         <template v-else-if="phase===5"><div class="report-layout"><div class="paper-card report-card"><div class="eyebrow">✉ &nbsp; FIELD REPORT</div><h2>Write to your expedition guide</h2><p>Tell Forrest about the {{ mission.animal }}. Where does it live? What did you notice? What would you like to ask?</p><textarea v-model="reportText" :disabled="!!reportReply" placeholder="Dear Forrest, Today I learned about..." rows="8" aria-label="Your field report"></textarea><div class="report-actions"><button class="primary-btn" :disabled="aiBusy || !apiKey || !online" @click="checkWriting">{{ aiBusy?'Checking…':'Check my writing ✳' }}</button><span v-if="!apiKey || !online" class="unavailable">AI check unavailable · {{ !apiKey?'add a key in Settings':'offline' }}</span></div><div v-if="aiError" class="inline-error" role="alert">{{ aiError }}</div><div v-if="corrections.length && reportText===checkedText" class="corrections"><h3>Let's fix these first</h3><div v-for="(c,i) in corrections" :key="i"><s>{{ c.original }}</s> → <b>{{ c.replacement }}</b><p>{{ c.explanation }}</p></div><small>Edit your letter, then check again.</small></div><div v-if="reportText===checkedText && !corrections.length && checkedText && !aiError" class="success-box">✓ Great writing! Your report is ready to send.</div><div class="report-actions"><button v-if="reportText===checkedText && !corrections.length && checkedText && !aiError" class="primary-btn" :disabled="aiBusy" @click="sendReport">{{ aiBusy?'Sending…':'Send report & get reply →' }}</button><button class="secondary-btn" @click="localReport">Finish offline with a local reply →</button></div></div><div class="report-sidebar"><div class="animal-tile large"><img :src="animalImages[missionIndex]!.src" :alt="animalImages[missionIndex]!.note"/></div><h3>{{ mission.animal }}</h3><p>{{ mission.fact }}</p><small class="image-credit">{{ animalImages[missionIndex]!.note }} · <a :href="animalImages[missionIndex]!.source" target="_blank" rel="noopener">{{ animalImages[missionIndex]!.credit }} ↗</a> · <a :href="licenseUrl(animalImages[missionIndex]!.license)" target="_blank" rel="noopener">{{ animalImages[missionIndex]!.license }}</a></small><small>AI replies are fictional game messages inspired by an explorer, not actual messages from Forrest Galante.</small></div></div></template>
         <template v-else><div class="paper-card complete-card"><div class="eyebrow">MISSION {{ mission.id }} COMPLETE</div><div class="big-trophy">🏆 <img :src="animalImages[missionIndex]!.src" :alt="animalImages[missionIndex]!.note"/></div><h2>A new trophy for your shelf!</h2><p>You helped document the {{ mission.animal }}. Your field notes are saved and a new adventure awaits.</p><div class="reply-card"><div class="eyebrow">✉ &nbsp; REPLY FROM YOUR EXPEDITION GUIDE</div><p>“{{ reportReply }}”</p></div><div class="complete-actions"><button class="primary-btn" v-if="missionIndex<9" @click="openMission(missionIndex+1)">Next mission →</button><button class="secondary-btn" @click="go('shelf')">Visit trophy shelf</button></div></div></template>
       </div>
