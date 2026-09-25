@@ -111,6 +111,11 @@ async function rescue(page, number) {
 async function race(page, number) {
   assert.equal(await page.locator('.race-car').count(), 4)
   assert(await page.locator('.race-near').evaluate(element => getComputedStyle(element).backgroundImage.includes('race-')))
+  assert(await page.locator('.player-car img').evaluate(image => image.complete && image.naturalWidth > 0))
+  assert.equal(await page.locator('.race-car img').count(), 4)
+  const cameraAtStart = await page.locator('.race-world').getAttribute('style')
+  const sceneryAtStart = await page.locator('.race-scene').getAttribute('style')
+  assert(await page.locator('.race-finish-line').evaluate(finish => finish.getBoundingClientRect().left > finish.closest('.race-track').getBoundingClientRect().right))
   if (number === 1) {
     await page.clock.fastForward(91000)
     await page.getByRole('heading', { name: 'The poachers got ahead!' }).waitFor()
@@ -118,8 +123,18 @@ async function race(page, number) {
     await page.getByRole('button', { name: 'Retry race' }).click()
     assert.equal(await page.locator('.race-metrics').innerText().then(text => text.includes('0% to finish')), true)
     await page.clock.runFor(12000)
-    assert(await page.locator('.rival-0').getAttribute('style').then(style => style !== 'left: 7%;'))
+    const at12 = Number((await page.locator('.rival-0').getAttribute('style')).match(/left: ([\d.]+)%/)?.[1])
+    await page.clock.runFor(2500)
+    const at145 = Number((await page.locator('.rival-0').getAttribute('style')).match(/left: ([\d.]+)%/)?.[1])
+    await page.clock.runFor(2500)
+    const at17 = Number((await page.locator('.rival-0').getAttribute('style')).match(/left: ([\d.]+)%/)?.[1])
+    assert(at12 > 0 && at145 > at12 && at17 > at145)
+    assert.notEqual(at145 - at12, at17 - at145, 'Rival speed should vary between typing bursts')
     if (process.env.RACE_SCREENSHOT) await page.locator('.race-scene').screenshot({ path: process.env.RACE_SCREENSHOT })
+    await page.clock.fastForward(45000)
+    await new Promise(resolve => setTimeout(resolve, 350))
+    const offscreen = await page.locator('.rival-0').evaluate(car => ({ car: car.getBoundingClientRect().left, track: car.closest('.race-track').getBoundingClientRect().right, style: car.getAttribute('style') }))
+    assert(offscreen.car > offscreen.track, `Rival should drive out of frame: ${JSON.stringify(offscreen)}`)
     await page.clock.resume()
     await page.keyboard.type('x')
     assert.equal(await page.locator('.race-metrics').innerText().then(text => text.includes('0% to finish')), true)
@@ -130,7 +145,19 @@ async function race(page, number) {
   for (let i = 0; i < count; i++) {
     const word = (await page.locator('.race-words .active').innerText()).trim()
     await page.keyboard.type(word + (i < count-1 ? ' ' : ''))
-    if (i === 0) assert.notEqual(await page.locator('.player-car').getAttribute('style'), initialPosition)
+    if (i === 0) {
+      assert.notEqual(await page.locator('.player-car').getAttribute('style'), initialPosition)
+      assert.notEqual(await page.locator('.race-scene').getAttribute('style'), sceneryAtStart)
+    }
+    if (i === Math.floor(count * .5)) assert.notEqual(await page.locator('.race-world').getAttribute('style'), cameraAtStart)
+    if (i === count - 4) {
+      await page.waitForTimeout(230)
+      assert(await page.locator('.race-finish-line').evaluate(finish => {
+        const line = finish.getBoundingClientRect(), track = finish.closest('.race-track').getBoundingClientRect()
+        return line.left >= track.left && line.right <= track.right
+      }), 'Finish should scroll into view close to the end')
+      if (number === 1 && process.env.RACE_FINISH_SCREENSHOT) await page.locator('.race-scene').screenshot({ path: process.env.RACE_FINISH_SCREENSHOT })
+    }
   }
   await page.getByRole('heading', { name: 'You won the race!' }).waitFor()
   assert.match(await page.locator('.stage-result .stars').innerText(), /★★★★★/)
@@ -185,7 +212,7 @@ async function testSkipsAndReport(browser) {
       const body = route.request().postDataJSON()
       const isCheck = body.messages[0].content.includes('punctuation coach')
       const content = isCheck
-        ? [JSON.stringify({ corrections: [{ original: 'teh', replacement: 'the', explanation: 'Check the spelling.' }] }), 'No errors found in your writing.', '{"corrections":[]}'][checks++]
+        ? [JSON.stringify({ corrections: [{ original: 'teh', replacement: 'the', explanation: 'Check the spelling.' }] }), '{"corrections":[]};', 'No errors found in your writing.'][checks++]
         : (replies++, 'Thank you, Henry! Your careful notes will help us protect the forest.')
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ choices: [{ message: { content } }] }) })
     })
@@ -232,7 +259,7 @@ try {
   assert.equal(await page.locator('.trophy-card:not(.empty)').count(), 10)
   assert(await page.locator('.trophy-figure img').first().evaluate(image => image.complete && image.naturalWidth > 0))
   assert(await page.evaluate(async () => (await fetch('/world-map.svg')).ok))
-  assert(await page.evaluate(async () => (await Promise.all(['/race-forest.svg','/race-mountains.svg','/race-shore.svg',...['forest','highland','water','wetland'].flatMap(habitat => [`/camera-${habitat}.svg`,`/camera-${habitat}-night.svg`])].map(path => fetch(path)))).every(response => response.ok)))
+  assert(await page.evaluate(async () => (await Promise.all(['/race-forest.svg','/race-mountains.svg','/race-shore.svg','/car-jeep.svg',...Array.from({ length: 3 }, (_, i) => `/car-villain-${i+1}.svg`),...['forest','highland','water','wetland'].flatMap(habitat => [`/camera-${habitat}.svg`,`/camera-${habitat}-night.svg`])].map(path => fetch(path)))).every(response => response.ok)))
   console.log('Smoke test passed: all 10 missions, flight, race, rescue, testing skips, AI report with no corrections, persistence and offline assets.')
 } finally {
   await browser?.close()

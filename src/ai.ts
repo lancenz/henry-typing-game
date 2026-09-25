@@ -18,7 +18,8 @@ async function request(key: string, model: string, system: string, content: stri
 
 export async function checkReport(key: string, model: string, text: string): Promise<Correction[]> {
   const answer = await request(key, model, 'You are a friendly spelling, grammar and punctuation coach for a ten-year-old. Check only actual writing errors, not style or factual claims. Return ONLY JSON in this format: {"corrections":[{"original":"exact substring in submitted text","replacement":"corrected substring","explanation":"brief kind explanation"}]}. Do not rewrite the whole letter. If no errors return exactly {"corrections":[]}; an empty list means the writing is ready to send.', text)
-  const cleaned = answer.replace(/^```(?:json)?\s*|\s*```$/g, '').trim()
+  // Some models append a JavaScript-style semicolon after otherwise valid JSON.
+  const cleaned = answer.replace(/^```(?:json)?\s*|\s*```$/g, '').trim().replace(/;\s*$/, '').trim()
   const noErrors = (message: string) => /^(?:no (?:writing |spelling |grammar |punctuation )?(?:errors?|mistakes?|corrections?)(?: (?:found|needed|to correct)(?: in (?:your|the) (?:writing|report|text))?)?|there are no (?:errors?|mistakes?|corrections?)(?: in (?:your|the) (?:writing|report|text))?|(?:your|the) (?:writing|report|text) (?:has|contains) no (?:errors?|mistakes?)|looks good|great (?:job|work))[.!]?$/i.test(message.trim())
   if (noErrors(cleaned)) return []
   try {

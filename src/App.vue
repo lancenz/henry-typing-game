@@ -5,7 +5,7 @@ import { animalImages } from './images'
 import { initDb, getResults, getTests, getReports, getSetting, setSetting, saveResult, saveTest, saveReport, type Result, type TestResult, type Report } from './db'
 import { checkReport, replyToReport, type Correction } from './ai'
 import { travelRoutes, travelWords, mapPoint } from './travel'
-import { raceWords, raceTerrain, rivalFinishTimes } from './race'
+import { raceWords, raceTerrain, rivalFinishTimes, rivalPath, rivalPosition, type RaceWaypoint } from './race'
 
 type Page = 'base' | 'map' | 'mission' | 'shelf' | 'test' | 'settings'
 const page = ref<Page>('base')
@@ -52,9 +52,8 @@ const raceElapsed = ref(0)
 const raceNow = ref(0)
 const boostUntil = ref(0)
 const rivalProgress = ref([0, 0, 0])
-const rivalHoldUntil = [0, 0, 0]
-const rivalNextHold = [0, 0, 0]
-let lastRaceTick = 0
+const rivalBoosts = ref([false, false, false])
+let rivalPaths: RaceWaypoint[][] = []
 const rescueLuck = ref(0)
 const rescueHold = ref(0)
 const rescueElapsed = ref(0)
@@ -82,6 +81,10 @@ const isRoute = computed(() => phase.value === 2)
 const isRace = computed(() => phase.value === 3)
 const isRescue = computed(() => phase.value === 4)
 const playerDistance = computed(() => correct.value / Math.max(1, prompts.value.join(' ').length))
+const raceView = .24
+const raceCamera = computed(() => Math.max(-raceView * .14, Math.min(1 - raceView * .82, playerDistance.value - raceView * .34)))
+const raceWorldStyle = computed(() => ({ width: `${100 / raceView}%`, transform: `translateX(${-raceCamera.value * 100}%)` }))
+const raceSceneryStyle = computed(() => ({ '--race-near-x': `${Math.round(-playerDistance.value * 3700)}px`, '--race-far-x': `${Math.round(-playerDistance.value * 1500)}px` }))
 const boosting = computed(() => raceNow.value < boostUntil.value)
 const flightStops = computed(() => travelRoutes[missionIndex.value]!.map(stop => ({ ...stop, ...mapPoint(stop) })))
 const flightProgress = computed(() => Math.min(1, (promptIndex.value + character.value / Math.max(1, currentPrompt.value.length)) / Math.max(1, prompts.value.length)))
@@ -163,10 +166,10 @@ function startStage() {
   stopTick()
   prompts.value = stagePrompts(); promptIndex.value = 0; character.value = 0; mistakes.value = 0; correct.value = 0
   failed.value = false; finished.value = false; feedback.value = ''
-  rivalProgress.value = [0, 0, 0]; rivalHoldUntil.fill(0); rivalNextHold.fill(0); raceElapsed.value = 0; boostUntil.value = 0
+  rivalProgress.value = [0, 0, 0]; rivalBoosts.value = [false, false, false]; rivalPaths = rivalFinishTimes.map(rivalPath); raceElapsed.value = 0; boostUntil.value = 0
   rescueKeys.length = 0; rescueLuck.value = 0; rescueHold.value = 0; rescueElapsed.value = 0; rescuePace.value = 0; rescueAccuracy.value = 0
   duration.value = isRoute.value ? 150 : 90
-  seconds.value = duration.value; started.value = Date.now(); lastRaceTick = started.value; lastRescueTick = started.value; raceNow.value = started.value; lastFlightKey.value = started.value; stallSeconds.value = 10; playing.value = true
+  seconds.value = duration.value; started.value = Date.now(); lastRescueTick = started.value; raceNow.value = started.value; lastFlightKey.value = started.value; stallSeconds.value = 10; playing.value = true
   tick = setInterval(() => {
     const now = Date.now()
     seconds.value = Math.max(0, duration.value - Math.floor((now - started.value) / 1000))
@@ -193,22 +196,11 @@ function updateLuck(now: number) {
   if (rescueHold.value >= 15) void endStage()
 }
 function updateRivals(now: number) {
-  const delta = Math.min(.25, (now - lastRaceTick) / 1000)
-  lastRaceTick = now; raceNow.value = now
+  raceNow.value = now
   raceElapsed.value = Math.max(0, (now - started.value) / 1000)
-  rivalProgress.value = rivalProgress.value.map((position, i) => {
-    const finish = rivalFinishTimes[i]!
-    const target = Math.min(1, raceElapsed.value / finish)
-    // Rivals briefly brake when far ahead; in the final stretch they recover
-    // their scheduled 91/100/110-second finish pace instead of drifting away.
-    if (raceElapsed.value < finish - 8 && target > playerDistance.value + .22 && now >= rivalNextHold[i]!) {
-      rivalHoldUntil[i] = now + 1200 + i * 250
-      rivalNextHold[i] = now + 4500 + i * 300
-    }
-    if (now < rivalHoldUntil[i]! && raceElapsed.value < finish - 8) return position
-    if (raceElapsed.value >= finish - 8) return Math.min(1, position + (1 - position) * delta / Math.max(.1, finish - raceElapsed.value))
-    return Math.min(target, position + delta * Math.max(1 / finish, (target - position) * .6))
-  })
+  const positions = rivalPaths.map(path => rivalPosition(path, raceElapsed.value))
+  rivalProgress.value = positions.map(position => position.distance)
+  rivalBoosts.value = positions.map(position => position.boosting)
 }
 async function endStage(timeout = false) {
   if (!playing.value) return
@@ -364,9 +356,9 @@ function licenseUrl(license: string) {
                 <div class="flight-overlay"><div class="flight-heading">✈ AUCKLAND → {{ mission.place.toUpperCase() }} <span>WORD {{ Math.min(promptIndex+1,prompts.length) }} / {{ prompts.length }}</span></div><div v-if="failed" class="flight-mayday">MAYDAY! FLIGHT INTERRUPTED</div><template v-else><div class="flight-words" aria-label="Words to type"><span v-for="(word,i) in prompts.slice(Math.max(0,promptIndex-1),promptIndex+6)" :key="Math.max(0,promptIndex-1)+i" :class="{past:Math.max(0,promptIndex-1)+i<promptIndex,active:Math.max(0,promptIndex-1)+i===promptIndex}"><template v-if="Math.max(0,promptIndex-1)+i===promptIndex"><b>{{ word.slice(0,character) }}</b><em>{{ expected===' ' ? '␣' : expected }}</em>{{ word.slice(Math.min(character+1,word.length)) }}</template><template v-else>{{ word }}</template></span></div><div class="flight-stats">{{ accuracy }}% accuracy · {{ mistakes }} misses <strong :class="{urgent:stallSeconds<=3}">✈ AIR: {{ stallSeconds }}s</strong></div></template></div>
                 <div class="flight-cartouche">THE WILD TYPE · WORLD EXPEDITION</div>
              </div>
-             <div v-else-if="isRace" class="race-scene" :class="[`terrain-${raceTerrain[missionIndex]}`,{lost:failed,won:finished,boosting:boosting && playing}]" role="group" :aria-label="`Race through ${mission.habitat}; you are ${Math.round(playerDistance*100)} percent of the way to the finish`">
-               <div class="race-sky"><div class="race-sun"></div><div class="race-far"></div><div class="race-near"></div><span class="race-place">{{ mission.habitat.toUpperCase() }} · {{ mission.region.toUpperCase() }}</span></div>
-               <div class="race-track"><div class="race-finish-line"><span>FINISH</span></div><div v-for="(rival,i) in rivalProgress" :key="i" class="race-lane"><span class="lane-label">{{ ['RED','BLUE','GOLD'][i] }} · {{ rivalFinishTimes[i] }}s</span><div class="race-car" :class="`rival-${i}`" :style="{left:`${7+rival*83}%`}"><div class="race-driver"><i></i><span></span></div><div class="race-body"><span class="race-wheel"></span><span class="race-wheel"></span></div><small>POACHER {{ i+1 }}</small></div></div><div class="race-lane player-lane"><span class="lane-label">HENRY · YOU</span><div class="race-car player-car" :class="{boost:boosting && playing}" :style="{left:`${7+playerDistance*83}%`}"><div class="race-driver"><i></i><span></span></div><div class="race-body"><span class="race-wheel"></span><span class="race-wheel"></span></div><small>HENRY</small></div></div></div>
+              <div v-else-if="isRace" class="race-scene" :class="[`terrain-${raceTerrain[missionIndex]}`,{lost:failed,won:finished,boosting:boosting && playing}]" :style="raceSceneryStyle" role="group" :aria-label="`Race through ${mission.habitat}; you are ${Math.round(playerDistance*100)} percent of the way to the finish`">
+                <div class="race-sky"><div class="race-sun"></div><div class="race-far"></div><div class="race-near"></div><span class="race-place">{{ mission.habitat.toUpperCase() }} · {{ mission.region.toUpperCase() }}</span></div>
+                <div class="race-track"><div class="race-world" :style="raceWorldStyle"><div class="race-finish-line"><span>FINISH</span></div><div v-for="(rival,i) in rivalProgress" :key="i" class="race-lane"><div class="race-car" :class="[`rival-${i}`,{surging:rivalBoosts[i]}]" :style="{left:`${rival*100}%`}"><img :src="`/car-villain-${i+1}.svg`" :alt="`Poacher ${i+1} car`"/><small>POACHER {{ i+1 }}</small></div></div><div class="race-lane player-lane"><div class="race-car player-car" :class="{boost:boosting && playing}" :style="{left:`${playerDistance*100}%`}"><img src="/car-jeep.svg" alt="Henry's expedition jeep"/><small>HENRY</small></div></div></div><div class="race-lane-labels"><span v-for="(time,i) in rivalFinishTimes" :key="i" class="lane-label">{{ ['PURPLE','RED','GOLD'][i] }} · {{ time }}s</span><span class="lane-label">HENRY · YOU</span></div></div>
                <div class="race-hud"><div class="race-title">{{ finished?'FINISH LINE · HENRY WINS!':failed?'RACE OVER · TRY AGAIN':'TYPE TO BOOST · BEAT 90 SECONDS' }} <span>{{ Math.min(promptIndex+1,prompts.length) }} / {{ prompts.length }} WORDS</span></div><div v-if="playing" class="race-words" aria-label="Words to type"><span v-for="(word,i) in prompts.slice(Math.max(0,promptIndex-1),promptIndex+6)" :key="Math.max(0,promptIndex-1)+i" :class="{past:Math.max(0,promptIndex-1)+i<promptIndex,active:Math.max(0,promptIndex-1)+i===promptIndex}"><template v-if="Math.max(0,promptIndex-1)+i===promptIndex"><b>{{ word.slice(0,character) }}</b><em>{{ expected===' '?'␣':expected }}</em>{{ word.slice(Math.min(character+1,word.length)) }}</template><template v-else>{{ word }}</template></span></div><div v-else class="race-words" :class="{'race-words-lost':failed}">{{ failed?'THE POACHERS ARE CLOSING IN':'YOU MADE IT TO THE FIELD SITE!' }}</div><div class="race-metrics">{{ Math.round(playerDistance*100) }}% to finish · {{ accuracy }}% accuracy · {{ mistakes }} misses <strong>{{ Math.floor(raceElapsed) }} / 90s</strong></div></div>
              </div>
              <div v-else-if="isRescue" class="rescue-scene" :class="[{night:rescueNight,green:rescueLuck>=100,spotted:finished},`habitat-${rescueScene}`]" role="group" :aria-label="`${mission.habitat} camera watch; Luck meter ${Math.round(rescueLuck)} percent; green hold ${Math.floor(rescueHold)} of 15 seconds`">
