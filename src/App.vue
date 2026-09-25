@@ -8,9 +8,9 @@ import { travelRoutes, travelWords, mapPoint } from './travel'
 import { raceWords, raceTerrain, rivalFinishTimes, rivalPath, rivalPosition, type RaceWaypoint } from './race'
 import { shuffledAnswers, normalizeQuestion, isHintRequest, isGameQuestion, isCorrectGuess } from './twenty'
 import { adventureThemes, isAdventureAction, type AdventureTheme } from './adventure'
-import { newDungeon, validDungeonSave, roomDescription, suggestedActions, applyDungeonIntent, itemName, directions, secretKey, stampyAdvice, dungeonContext, type DungeonGame } from './dungeon'
+import { newDungeon, validDungeonSave, upgradeDungeonSave, roomDescription, suggestedActions, applyDungeonIntent, itemName, directions, secretKey, stampyAdvice, dungeonContext, type DungeonGame } from './dungeon'
 
-type Page = 'base' | 'map' | 'mission' | 'shelf' | 'test' | 'twenty' | 'adventure' | 'dungeon' | 'settings'
+type Page = 'base' | 'map' | 'mission' | 'shelf' | 'test' | 'games' | 'twenty' | 'adventure' | 'dungeon' | 'settings'
 const page = ref<Page>('base')
 const ready = ref(false)
 const error = ref('')
@@ -18,7 +18,8 @@ const results = ref<Result[]>([])
 const tests = ref<TestResult[]>([])
 const reports = ref<Report[]>([])
 const apiKey = ref('')
-const model = ref('openai/gpt-4o-mini')
+const modelOptions = ['~deepseek/deepseek-flash-latest', 'openai/gpt-oss-120b', '~anthropic/claude-sonnet-latest', 'google/gemini-3.8-flash', '~openai/gpt-sol-latest'] as const
+const model = ref<string>(modelOptions[0])
 const voice = ref(true)
 const speechLanguage = ref('en-US')
 const speechVoice = ref('')
@@ -96,7 +97,7 @@ const adventureError = ref('')
 const adventureBusy = ref(false)
 const adventureLog = ref<HTMLDivElement | null>(null)
 let adventureGameId = 0
-type DungeonMessage = { role: 'player' | 'guide'; text: string }
+type DungeonMessage = { role: 'player' | 'guide'; text: string; thinking?: boolean; duration?: string }
 const dungeon = ref<DungeonGame | null>(null)
 const dungeonMessages = ref<DungeonMessage[]>([])
 const dungeonAction = ref('')
@@ -116,12 +117,26 @@ const dungeonMap = computed(() => Array.from({ length: 25 }, (_, id) => {
   const game = dungeon.value
   const seen = !!game?.visited[game.level]?.includes(id)
   const room = game?.levels[game.level]?.rooms[id]
+  const hasMap = !!game?.inventory.includes(`${game.level}:map`)
+  const mapped = hasMap && room?.active !== false
+  const compass = !!game?.inventory.includes(`${game.level}:compass`)
   const doors = directions.filter(direction => {
     const door = room?.doors[direction]
     return !!game && seen && !!door && (!door.secret || game.revealed.includes(secretKey(game.level, Math.min(id, door.to))))
   })
-  return { id, seen, doors, frontier: doors.filter(direction => !game?.visited[game.level]?.includes(room?.doors[direction]?.to ?? -1)) }
+  const stairs = compass && id === game?.levels[game.level]?.exit
+  const monster = compass && !!room && Object.values(room.doors).some(door => door.gate === 'monster')
+  return { id, seen, mapped, absent: hasMap && room?.active === false, stairs, monster, doors, frontier: doors.filter(direction => !game?.visited[game.level]?.includes(room?.doors[direction]?.to ?? -1)) }
 }))
+const dungeonCompassHint = computed(() => {
+  const game = dungeon.value
+  if (!game?.inventory.includes(`${game.level}:compass`)) return ''
+  const floor = game.levels[game.level]!
+  const x = floor.exit % 5 - game.room % 5, y = Math.floor(floor.exit / 5) - Math.floor(game.room / 5)
+  const bearing = [y < 0 ? 'north' : y > 0 ? 'south' : '', x > 0 ? 'east' : x < 0 ? 'west' : ''].filter(Boolean).join('-') || 'here'
+  const monsters = floor.rooms.filter(room => room.active !== false && Object.values(room.doors).some(door => door.gate === 'monster')).map(room => room.id + 1)
+  return `Magic compass: stairs and guardian in room ${floor.exit + 1} (${bearing}); monster signs near ${monsters.length ? `room${monsters.length > 1 ? 's' : ''} ${monsters.join(', ')}` : 'no rooms on this floor'}. You still need to visit rooms before navigating to them.`
+})
 const lastFlightKey = ref(0)
 const stallSeconds = ref(10)
 const raceElapsed = ref(0)
@@ -210,12 +225,12 @@ function refresh() { results.value = getResults(); tests.value = getTests(); rep
 onMounted(async () => {
   if (speechAvailable) { speechSynthesis.addEventListener('voiceschanged', refreshVoices); refreshVoices() }
   try {
-    await initDb(); refresh(); apiKey.value = getSetting('key'); model.value = getSetting('model') || model.value; voice.value = getSetting('voice') !== 'off'; speechLanguage.value = getSetting('speech-language') || 'en-US'; speechVoice.value = getSetting('speech-voice')
+    await initDb(); refresh(); apiKey.value = getSetting('key'); model.value = modelOptions.find(option => option === getSetting('model')) ?? modelOptions[0]; voice.value = getSetting('voice') !== 'off'; speechLanguage.value = getSetting('speech-language') || 'en-US'; speechVoice.value = getSetting('speech-voice')
     const saved = getSetting('dungeon-save')
     if (saved) {
       try {
         const loaded: unknown = JSON.parse(saved)
-        if (validDungeonSave(loaded)) { dungeon.value = loaded; dungeonMessage('guide', loaded.phase === 'maze' ? `Welcome back, Henry! ${roomDescription(loaded)}` : loaded.phase === 'dragon' ? `The dragon watches you closely. ${stampyAdvice(loaded)}` : 'Welcome back! You and your dragon friend already found your way out.') }
+        if (validDungeonSave(loaded)) { dungeon.value = upgradeDungeonSave(loaded); dungeonMessage('guide', loaded.phase === 'maze' ? `Welcome back, Henry! ${roomDescription(loaded)}` : loaded.phase === 'dragon' ? `The dragon watches you closely. ${stampyAdvice(loaded)}` : 'Welcome back! You and your dragon friend already found your way out.') }
       } catch { /* An invalid saved game does not prevent the rest of the app from loading. */ }
     }
     ready.value = true
@@ -415,8 +430,8 @@ function adventureMessage(message: AdventureMessage) {
   adventureMessages.value.push(message)
   void nextTick(() => { if (adventureLog.value) adventureLog.value.scrollTop = adventureLog.value.scrollHeight })
 }
-function dungeonMessage(role: DungeonMessage['role'], text: string) {
-  dungeonMessages.value.push({ role, text })
+function dungeonMessage(role: DungeonMessage['role'], text: string, duration?: string) {
+  dungeonMessages.value.push({ role, text, duration })
   void nextTick(() => { if (dungeonLog.value) dungeonLog.value.scrollTop = dungeonLog.value.scrollHeight })
 }
 async function startDungeon() {
@@ -442,20 +457,27 @@ async function sendDungeonAction() {
   if (action.length < 5 || !/\p{L}/u.test(action)) { dungeonError.value = 'Type a full action in words, such as “peek through the left door”.'; return }
   dungeonError.value = ''; dungeonCorrections.value = []; dungeonBusy.value = true
   const id = dungeonGameId
+  const start = performance.now()
+  dungeonMessage('player', action)
+  dungeonMessages.value.push({ role: 'guide', text: 'Stampy and the dungeon guide are thinking…', thinking: true })
+  const waiting = dungeonMessages.value.at(-1)!
+  void nextTick(() => { if (dungeonLog.value) dungeonLog.value.scrollTop = dungeonLog.value.scrollHeight })
   try {
     const checked = await reviewDungeonAction(apiKey.value, model.value, dungeonContext(game), action)
     if (id !== dungeonGameId) return
-    if (checked.corrections.length) { dungeonCorrections.value = checked.corrections; return }
+    const duration = `${((performance.now() - start) / 1000).toFixed(1)}s`
+    if (checked.corrections.length) { dungeonCorrections.value = checked.corrections; waiting.text = 'Stampy says: “A few words need fixing first. Nothing in the dungeon has changed.”'; waiting.duration = duration; return }
     dungeonAction.value = ''
-    dungeonMessage('player', action)
     const outcome = applyDungeonIntent(game, checked.intent!)
-    dungeonMessage('guide', outcome.text)
+    waiting.text = outcome.text; waiting.duration = duration
     if (outcome.changed) await setSetting('dungeon-save', JSON.stringify(game))
-  } catch (e) { if (id === dungeonGameId) dungeonError.value = String(e instanceof Error ? e.message : e) }
+  } catch (e) { if (id === dungeonGameId) { dungeonError.value = String(e instanceof Error ? e.message : e); waiting.text = 'Stampy says: “The guide could not answer just now. Your action has not changed the dungeon.”'; waiting.duration = `${((performance.now() - start) / 1000).toFixed(1)}s` } }
   finally {
     if (id === dungeonGameId) {
+      waiting.thinking = false
       dungeonBusy.value = false
       await nextTick()
+      if (dungeonLog.value) dungeonLog.value.scrollTop = dungeonLog.value.scrollHeight
       if (page.value === 'dungeon' && dungeon.value?.phase !== 'won' && online.value) dungeonInput.value?.focus()
     }
   }
@@ -608,7 +630,8 @@ function licenseUrl(license: string) {
         <button :class="{active:page==='base'}" @click="go('base')"><span>⌂</span> Base camp</button>
         <button :class="{active:page==='map'||page==='mission'}" @click="go('map')"><span>◇</span> Missions <b>{{ completed.size }}/10</b></button>
         <button :class="{active:page==='shelf'}" @click="go('shelf')"><span>♜</span> Trophy shelf</button>
-        <button :class="{active:page==='test'||page==='twenty'||page==='adventure'||page==='dungeon'}" @click="go('test')"><span>◷</span> Typing test</button>
+        <button :class="{active:page==='test'}" @click="go('test')"><span>◷</span> Typing test</button>
+        <button :class="{active:page==='games'||page==='twenty'||page==='adventure'||page==='dungeon'}" @click="go('games')"><span>✦</span> Typing games</button>
       </nav>
       <div class="side-label tools-label">FIELD TOOLS</div>
       <nav><button :class="{active:page==='settings'}" @click="go('settings')"><span>⚙</span> Settings</button></nav>
@@ -616,7 +639,7 @@ function licenseUrl(license: string) {
     </aside>
 
     <main class="main">
-      <header class="topbar"><div class="breadcrumb">THE EXPEDITION <span>/</span> {{ page === 'mission' ? `MISSION ${mission.id}` : page === 'base' ? 'BASE CAMP' : page === 'twenty' ? 'TYPING TEST / 20 QUESTIONS' : page === 'adventure' ? 'TYPING TEST / STORY ADVENTURE' : page === 'dungeon' ? 'TYPING TEST / DUNGEON LABYRINTH' : page.toUpperCase() }}</div><div class="top-actions"><span class="offline-pill"><i></i> {{ online ? 'OFFLINE READY' : 'PLAYING OFFLINE' }}</span><span class="gold-pill">✦ <b>{{ earned }}</b> GOLD</span></div></header>
+      <header class="topbar"><div class="breadcrumb">THE EXPEDITION <span>/</span> {{ page === 'mission' ? `MISSION ${mission.id}` : page === 'base' ? 'BASE CAMP' : page === 'twenty' ? 'TYPING GAMES / 20 QUESTIONS' : page === 'adventure' ? 'TYPING GAMES / STORY ADVENTURE' : page === 'dungeon' ? 'TYPING GAMES / DUNGEON LABYRINTH' : page === 'games' ? 'TYPING GAMES' : page.toUpperCase() }}</div><div class="top-actions"><span class="offline-pill"><i></i> {{ online ? 'OFFLINE READY' : 'PLAYING OFFLINE' }}</span><span class="gold-pill">✦ <b>{{ earned }}</b> GOLD</span></div></header>
       <div v-if="error" class="error-banner" role="alert">{{ error }} <button @click="error=''">×</button></div>
       <div v-if="!ready && !error" class="loading">Setting up base camp…</div>
 
@@ -689,18 +712,19 @@ function licenseUrl(license: string) {
            </div>
            <p class="small-note">{{ !speechAvailable ? 'Speech is not supported in this browser.' : !speechVoices.length ? 'No voices listed yet. Your browser may still be loading them; try Test voice or reopen Settings.' : !matchingVoices.length ? 'No listed voice for this language. The browser will try its default voice.' : 'Voices come from your browser and device. Local voices work offline; online voices may need internet. Language changes pronunciation, not the English game text.' }}</p>
            <button class="secondary-btn" :disabled="!voice || !speechAvailable" @click="testSpeech">Test voice ◖))</button><span v-if="speechFeedback" class="setting-feedback" role="status">{{ speechFeedback }}</span>
-           <hr><h2>Optional AI field reports</h2><p>OpenRouter checks writing and creates fictional expedition-guide replies. The rest of the game works offline.</p><label class="field-label">OPENROUTER API KEY<input v-model="apiKey" type="password" autocomplete="off" placeholder="sk-or-…" /></label><label class="field-label">CHAT MODEL<input v-model="model" type="text" placeholder="openai/gpt-4o-mini" /></label><p class="small-note">The key is stored locally in this browser's SQLite database. Calls go directly from your browser to OpenRouter; use a restricted key if possible. AI is unavailable without an internet connection.</p><button class="primary-btn" @click="saveSettings">Save settings →</button><span class="setting-feedback" role="status">{{ feedback }}</span>
+            <hr><h2>Optional AI field reports</h2><p>OpenRouter checks writing and creates fictional expedition-guide replies. The rest of the game works offline.</p><label class="field-label">OPENROUTER API KEY<input v-model="apiKey" type="password" autocomplete="off" placeholder="sk-or-…" /></label><label class="field-label">CHAT MODEL<select v-model="model"><option v-for="option in modelOptions" :key="option" :value="option">{{ option }}</option></select></label><p class="small-note">The key is stored locally in this browser's SQLite database. Calls go directly from your browser to OpenRouter; use a restricted key if possible. AI is unavailable without an internet connection.</p><button class="primary-btn" @click="saveSettings">Save settings →</button><span class="setting-feedback" role="status">{{ feedback }}</span>
          </div>
          <div class="fact-strip"><span>ⓘ</span><p>For best offline use, install the PWA from Chrome or Edge after loading it once while online. Available speech voices depend on your browser and operating system.</p></div>
        </div>
       <div v-if="page==='test' && countdown" :key="countdown" class="game-countdown test-countdown" role="status" aria-live="assertive"><strong>{{ countdown }}</strong><span>GET READY · TYPING TEST</span></div>
-      <section v-if="ready && page==='test'" class="content twenty-promo">
+      <section v-if="ready && page==='games'" class="content twenty-promo">
+        <div class="page-head typing-games-head"><div class="eyebrow">THREE WAYS TO PLAY</div><h1>Typing <em>games.</em></h1><p>Choose a game and practice your words through questions, stories, or dungeon adventures.</p></div>
         <div class="paper-card twenty-promo-card"><div><div class="eyebrow">A NEW WAY TO TYPE</div><h2>Play 20 Questions</h2><p>Guess an everyday animal, plant or material by typing yes-or-no questions. An AI guide answers while you practice spelling.</p></div><button class="primary-btn" @click="go('twenty')">Play 20 Questions →</button></div>
         <div class="paper-card twenty-promo-card"><div><div class="eyebrow">CHOOSE YOUR OWN PATH</div><h2>Story adventure</h2><p>Pick a favourite theme, then type your way through a short, original adventure with four paths at every turn.</p></div><button class="primary-btn" @click="go('adventure')">Play Story Adventure →</button></div>
         <div class="paper-card twenty-promo-card"><div><div class="eyebrow">FIVE FLOORS · ONE DRAGON</div><h2>Dungeon labyrinth</h2><p>Explore a changing maze with Stampy the talking cat, collect tools and gold, and type your way past tricky doors.</p></div><button class="primary-btn" @click="go('dungeon')">Play Dungeon Labyrinth →</button></div>
       </section>
       <div v-if="ready && page==='twenty'" class="content twenty-content">
-        <button class="back-link" @click="go('test')">← Back to typing test</button>
+        <button class="back-link" @click="go('games')">← Back to typing games</button>
         <div class="page-head"><div class="eyebrow">THE MYSTERY GAME</div><h1>20 <em>Questions.</em></h1><p>Ask yes-or-no questions about a familiar animal, plant or material. Guess before your 20 questions run out!</p></div>
         <div class="twenty-top"><div><b>{{ mysteryStatus==='idle'?'READY TO PLAY':mysteryStatus==='won'?'MYSTERY SOLVED':mysteryStatus==='lost'?'OUT OF QUESTIONS':'MYSTERY IN PROGRESS' }}</b><small>Spelling is checked before a question is sent. Unclear or repeated questions do not use a turn.</small></div><strong>{{ mysteryRemaining }} <span>/ 20 LEFT</span></strong></div>
         <div class="paper-card twenty-card">
@@ -713,7 +737,7 @@ function licenseUrl(license: string) {
         </div>
       </div>
       <div v-if="ready && page==='adventure'" class="content twenty-content adventure-content">
-        <button class="back-link" @click="go('test')">← Back to typing test</button>
+        <button class="back-link" @click="go('games')">← Back to typing games</button>
         <div class="page-head"><div class="eyebrow">A NEW STORY EACH TIME</div><h1>Story <em>adventure.</em></h1><p>Choose a theme and type what you want to do. Follow a suggested path or try a sensible new idea!</p></div>
         <div class="twenty-top"><div><b>{{ adventureStatus==='idle'?'CHOOSE A THEME':adventureStatus==='finished'?'THE END':adventureThemes.find(item=>item.id===adventureTheme)?.name.toUpperCase() }}</b><small>Type an action in words · Spelling is checked before the story continues · Unclear actions keep their turn.</small></div><strong>{{ adventureTurn }} <span>/ 20 TURNS</span></strong></div>
         <div class="paper-card twenty-card adventure-card">
@@ -726,32 +750,31 @@ function licenseUrl(license: string) {
         </div>
       </div>
       <div v-if="ready && page==='dungeon'" class="content dungeon-content">
-        <button class="back-link" @click="go('test')">← Back to typing test</button>
+        <button class="back-link" @click="go('games')">← Back to typing games</button>
         <div class="page-head"><div class="eyebrow">THE FIVE MAGIC STONES</div><h1>Dungeon <em>labyrinth.</em></h1><p>Type your decisions in full sentences. Peek before entering danger, ask Stampy for help, and collect each stone to reach the dragon.</p></div>
-        <div class="twenty-top"><div><b>{{ !dungeon?'READY TO EXPLORE':dungeon.phase==='won'?'FRIENDS WITH A DRAGON':dungeon.phase==='dragon'?'THE DRAGON AWAITS':`LEVEL ${dungeon.level+1} · ${dungeonRoom?.title.toUpperCase()}` }}</b><small>Five levels · 25 rooms each · Spelling is checked before your action counts · Map and items survive a death.</small></div><strong>{{ dungeon?.stones.length ?? 0 }} <span>/ 5 STONES</span></strong></div>
+        <div class="twenty-top"><div><b>{{ !dungeon?'READY TO EXPLORE':dungeon.phase==='won'?'FRIENDS WITH A DRAGON':dungeon.phase==='dragon'?'THE DRAGON AWAITS':`LEVEL ${dungeon.level+1} · ${dungeonRoom?.title.toUpperCase()}` }}</b><small>Five levels · 20–24 rooms each · Spelling is checked before your action counts · Map and items survive a death.</small></div><strong>{{ dungeon?.stones.length ?? 0 }} <span>/ 5 STONES</span></strong></div>
         <div v-if="!dungeon" class="paper-card dungeon-intro"><span class="twenty-icon">◇</span><h2>Find your way out together.</h2><p>Each new game creates a fresh five-level maze. A lost talking cat named Stampy will help you; treasures, equipment and explored rooms remain yours if you die. The dragon needs kindness, not a sword.</p><button class="primary-btn" :disabled="dungeonBusy || !apiKey || !online" @click="startDungeon">Start a new dungeon →</button><p v-if="!apiKey || !online" class="unavailable">An OpenRouter key and internet connection are needed for typed actions. <button class="text-btn" @click="go('settings')">Open Settings →</button></p></div>
         <div v-else class="dungeon-layout">
           <section class="paper-card dungeon-main">
-            <div v-if="dungeon.phase==='maze'" class="dungeon-room"><div class="eyebrow">LEVEL {{ dungeon.level+1 }} / 5 · ROOM {{ dungeon.room+1 }} / 25</div><h2>{{ dungeonRoom?.title }}</h2><p>{{ roomDescription(dungeon) }}</p></div>
-            <div v-else class="dungeon-room dragon-room"><div class="eyebrow">{{ dungeon.phase==='won'?'THE END':'THE FINAL CONVERSATION' }}</div><h2>{{ dungeon.phase==='won'?'Ride into the sunset':'The unnamed dragon' }}</h2><p>{{ dungeon.phase==='won'?'You and Stampy have found a new friend.':'A giant fire-breathing dragon watches over its lost stones. It thinks you stole them, and hopes someone will give it a name. Talk kindly, and listen to its answers.' }}</p></div>
-             <div ref="dungeonLog" class="twenty-chat dungeon-chat" role="log" aria-label="Dungeon events" aria-live="polite"><div v-for="(message,i) in dungeonMessages" :key="i" class="twenty-message" :class="message.role"><small>{{ message.role==='player'?'YOU':'DUNGEON GUIDE' }}</small><p>{{ message.text }}</p></div></div>
+             <div ref="dungeonLog" class="twenty-chat dungeon-chat" role="log" aria-label="Dungeon events" aria-live="polite"><div v-for="(message,i) in dungeonMessages" :key="i" class="twenty-message" :class="[message.role,{thinking:message.thinking}]"><div class="dungeon-message-heading"><small>{{ message.role==='player'?'YOU':'DUNGEON GUIDE' }}</small><span v-if="message.duration" class="dungeon-call-time" :aria-label="`Guide response time ${message.duration}`">{{ message.duration }}</span></div><p>{{ message.text }}<span v-if="message.thinking" class="dungeon-thinking-dots" aria-hidden="true"> ● ● ●</span></p></div></div>
              <div v-if="dungeon.phase!=='won'" class="dungeon-choices"><b>FOUR IDEAS · TYPE YOUR OWN ACTION</b><ol v-if="dungeon.phase==='maze'"><li v-for="choice in suggestedActions(dungeon)" :key="choice">{{ choice }}</li></ol><ol v-else><li>Ask the dragon about its lost stones</li><li>Return the five magic stones</li><li>Offer the dragon a friendly name</li><li>Say something kind to the dragon</li></ol></div>
-             <div v-if="dungeon.phase!=='won'" class="twenty-controls"><form @submit.prevent="sendDungeonAction"><label for="dungeon-action">WHAT DO YOU DO NEXT?</label><div class="twenty-input-row"><input id="dungeon-action" ref="dungeonInput" v-model="dungeonAction" type="text" maxlength="240" :disabled="dungeonBusy || !online" autocomplete="off" placeholder="I carefully peek through the door on the left…"/><button class="primary-btn" type="submit" :disabled="dungeonBusy || !dungeonAction.trim() || !online">{{ dungeonBusy?'Checking…':'Do it →' }}</button></div></form><div v-if="dungeonCorrections.length" class="twenty-corrections" role="alert"><b>Fix the spelling first; nothing has changed:</b><p v-for="(item,i) in dungeonCorrections" :key="i"><s>{{ item.original }}</s> → <strong>{{ item.replacement }}</strong> · {{ item.explanation }}</p></div><p v-if="!online" class="unavailable">Reconnect to send your next action. Your maze is saved on this device.</p></div>
+              <div v-if="dungeon.phase!=='won'" class="twenty-controls"><form @submit.prevent="sendDungeonAction"><label for="dungeon-action">WHAT DO YOU DO NEXT?</label><div class="twenty-input-row"><input id="dungeon-action" ref="dungeonInput" v-model="dungeonAction" type="text" maxlength="240" :disabled="dungeonBusy || !online" autocomplete="off" placeholder="I carefully peek through the east door…"/><button class="primary-btn" type="submit" :disabled="dungeonBusy || !dungeonAction.trim() || !online">{{ dungeonBusy?'Checking…':'Do it →' }}</button></div></form><div v-if="dungeonCorrections.length" class="twenty-corrections" role="alert"><b>Fix the spelling first; nothing has changed:</b><p v-for="(item,i) in dungeonCorrections" :key="i"><s>{{ item.original }}</s> → <strong>{{ item.replacement }}</strong> · {{ item.explanation }}</p></div><p v-if="!online" class="unavailable">Reconnect to send your next action. Your maze is saved on this device.</p></div>
             <div v-else class="twenty-finish"><h3>Well done, Henry and Stampy!</h3><p>The dragon has its stones back, a kind new name, and two new friends.</p></div>
             <p v-if="dungeonError" class="inline-error" role="alert">{{ dungeonError }}</p>
             <button class="text-btn dungeon-restart" :disabled="dungeonBusy || !online" @click="startDungeon">Start a different dungeon →</button>
           </section>
           <aside class="dungeon-sidebar">
             <div class="paper-card dungeon-map-card">
-              <div class="eyebrow">FOG-OF-WAR MAP · LEVEL {{ dungeon.level+1 }}</div>
+               <div class="eyebrow">DUNGEON MAP · LEVEL {{ dungeon.level+1 }}</div>
               <div class="dungeon-compass" role="img" aria-label="Compass: North at top, East at right, South at bottom, West at left"><span class="compass-north">NORTH</span><span class="compass-west">WEST</span><span class="compass-center">✣</span><span class="compass-east">EAST</span><span class="compass-south">SOUTH</span></div>
               <div class="dungeon-grid" role="group" aria-label="Map of explored rooms and visible doors">
                 <template v-for="tile in dungeonMap" :key="tile.id">
-                  <button v-if="tile.seen" type="button" class="dungeon-tile visited" :class="{current:dungeon.room===tile.id && dungeon.phase==='maze'}" :aria-label="`Room ${tile.id+1}${dungeon.room===tile.id && dungeon.phase==='maze'?' current':''}: ${roomDescription(dungeon, tile.id)}`" :title="`Room ${tile.id+1}: ${roomDescription(dungeon, tile.id)}`" @mouseenter="dungeonMapHover=tile.id" @mouseleave="dungeonMapHover=null" @focus="dungeonMapHover=tile.id" @blur="dungeonMapHover=null"><span v-for="dir in tile.doors" :key="dir" class="dungeon-door" :class="[`door-${dir}`,{frontier:tile.frontier.includes(dir)}]"></span><b>{{ tile.id+1 }}</b></button>
-                  <div v-else class="dungeon-tile" aria-label="Unexplored room"></div>
+                   <button v-if="tile.seen" type="button" class="dungeon-tile visited" :class="{current:dungeon.room===tile.id && dungeon.phase==='maze'}" :aria-label="`Room ${tile.id+1}${dungeon.room===tile.id && dungeon.phase==='maze'?' current':''}: ${roomDescription(dungeon, tile.id)}`" :title="`Room ${tile.id+1}: ${roomDescription(dungeon, tile.id)}`" @mouseenter="dungeonMapHover=tile.id" @mouseleave="dungeonMapHover=null" @focus="dungeonMapHover=tile.id" @blur="dungeonMapHover=null"><span v-for="dir in tile.doors" :key="dir" class="dungeon-door" :class="[`door-${dir}`,{frontier:tile.frontier.includes(dir)}]"></span><b>{{ tile.id+1 }}</b><small v-if="tile.stairs">★</small><small v-else-if="tile.monster">!</small></button>
+                   <div v-else class="dungeon-tile" :class="{absent:tile.absent,mapped:tile.mapped}" :aria-label="tile.absent?'Outside the dungeon':tile.mapped?`Unvisited room ${tile.id+1}${tile.stairs?', stairs and guardian':tile.monster?', monster nearby':''}`:'Unexplored room'"><b v-if="tile.mapped">{{ tile.id+1 }}</b><small v-if="tile.mapped && tile.stairs">★</small><small v-else-if="tile.mapped && tile.monster">!</small></div>
                 </template>
               </div>
-              <p class="dungeon-map-key">Highlighted room: {{ dungeon.room+1 }} · bright door: unexplored passage.</p>
+               <p class="dungeon-map-key">Highlighted room: {{ dungeon.room+1 }} · bright door: unexplored passage · ★ stairs/guardian · ! monster (with magic compass).</p>
+               <p v-if="dungeonCompassHint" class="dungeon-compass-hint">{{ dungeonCompassHint }}</p>
               <p v-if="dungeonTooltip" class="dungeon-map-tooltip" role="status">{{ dungeonTooltip }}</p><p v-else class="small-note">Hover or focus a visited room to read its description. Type “go to room 12” to return to a visited room.</p>
             </div>
             <div class="paper-card dungeon-inventory"><div class="eyebrow">YOUR PACK</div><h3>Inventory</h3><ul><li v-for="item in dungeon.inventory" :key="item">{{ itemName(item) }}</li><li v-if="!dungeon.inventory.length">Empty for now. Pick up anything useful.</li></ul><div class="dungeon-treasures">✦ {{ dungeon.gold }} gold <span>✧ {{ dungeon.stones.length }} / 5 stones</span></div><small>{{ dungeon.deaths }} {{ dungeon.deaths===1?'reset':'resets' }} · Progress kept</small></div>
