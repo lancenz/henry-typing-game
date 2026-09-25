@@ -46,8 +46,6 @@ const testCorrect = ref(0)
 const testMistakes = ref(0)
 const testTime = ref(60)
 const testOutcome = ref({ wpm: 0, accuracy: 0, score: 0, record: false })
-const selectedIndex = ref<number | null>(null)
-const clearedIndices = ref<number[]>([])
 const lastFlightKey = ref(0)
 const stallSeconds = ref(10)
 const raceElapsed = ref(0)
@@ -57,6 +55,20 @@ const rivalProgress = ref([0, 0, 0])
 const rivalHoldUntil = [0, 0, 0]
 const rivalNextHold = [0, 0, 0]
 let lastRaceTick = 0
+const rescueLuck = ref(0)
+const rescueHold = ref(0)
+const rescueElapsed = ref(0)
+const rescuePace = ref(0)
+const rescueAccuracy = ref(0)
+const rescueSceneIndex = computed(() => Math.min(8, Math.floor(rescueElapsed.value / 10)))
+const rescueNight = computed(() => rescueSceneIndex.value % 2 === 1)
+const rescueScene = computed(() => {
+  const habitat = mission.value.habitat.toLowerCase()
+  return habitat.includes('ocean') || habitat.includes('lake') || habitat.includes('river') ? 'water' : habitat.includes('volcanic') || habitat.includes('mountain') ? 'highland' : habitat.includes('swamp') ? 'wetland' : 'forest'
+})
+const rescueKeys: { time: number; correct: boolean }[] = []
+let lastRescueTick = 0
+const rescueTarget = computed(() => 10 + (mission.value.id - 1) * 2)
 const gameInput = ref<HTMLInputElement | null>(null)
 const online = ref(navigator.onLine)
 let tick: ReturnType<typeof setInterval> | undefined
@@ -68,6 +80,7 @@ const completed = computed(() => new Set(reports.value.map(r => r.mission)))
 const unlocked = computed(() => Math.min(missions.length, completed.value.size + 1))
 const isRoute = computed(() => phase.value === 2)
 const isRace = computed(() => phase.value === 3)
+const isRescue = computed(() => phase.value === 4)
 const playerDistance = computed(() => correct.value / Math.max(1, prompts.value.join(' ').length))
 const boosting = computed(() => raceNow.value < boostUntil.value)
 const flightStops = computed(() => travelRoutes[missionIndex.value]!.map(stop => ({ ...stop, ...mapPoint(stop) })))
@@ -91,12 +104,9 @@ const cameraStyle = computed(() => {
   const y = clamp(.6 - mapZoom.value * focusY)
   return { transform: `translate(${x * 100}%, ${y * 100}%) scale(${mapZoom.value})` }
 })
-const isBoard = computed(() => phase.value === 4)
-const boardKind = computed(() => ['vines','cameras','tracks','river','lake','radio','tracks','sonar','lookout','journal'][missionIndex.value] ?? 'tracks')
-const currentPrompt = computed(() => isBoard.value ? prompts.value[selectedIndex.value ?? -1] ?? '' : (isRoute.value || isRace.value) && promptIndex.value < prompts.value.length - 1 ? `${prompts.value[promptIndex.value]} ` : prompts.value[promptIndex.value] ?? '')
+const currentPrompt = computed(() => (isRescue.value || (isRoute.value || isRace.value) && promptIndex.value < prompts.value.length - 1) ? `${prompts.value[promptIndex.value] ?? ''} ` : prompts.value[promptIndex.value] ?? '')
 const expected = computed(() => currentPrompt.value[character.value] ?? '')
-const stageName = computed(() => phase.value === 2 ? 'Expedition route' : phase.value === 3 ? 'Race to the field site' : `Protect the ${mission.value.animal}`)
-const progress = computed(() => prompts.value.length ? Math.round((promptIndex.value / prompts.value.length) * 100) : 0)
+const stageName = computed(() => phase.value === 2 ? 'Expedition route' : phase.value === 3 ? 'Race to the field site' : 'Wildlife camera watch')
 const accuracy = computed(() => correct.value + mistakes.value ? Math.round(100 * correct.value / (correct.value + mistakes.value)) : 100)
 const fingers: Record<string, string> = {
   '`':'Left pinky','1':'Left pinky','q':'Left pinky','a':'Left pinky','z':'Left pinky',
@@ -128,9 +138,6 @@ function speak(text: string) {
   utterance.rate = 0.82; utterance.pitch = 1.05; utterance.lang = 'en-US'
   speechSynthesis.speak(utterance)
 }
-function sayPrompt() {
-  if (currentPrompt.value && !currentPrompt.value.includes(' ')) speak(`${currentPrompt.value}. ${[...currentPrompt.value].join(', ')}`)
-}
 function go(where: Page) { stopTick(); playing.value = false; testPlaying.value = false; speechSynthesis.cancel(); page.value = where }
 function openMission(index: number) {
   if (index >= unlocked.value) return
@@ -147,24 +154,41 @@ function nextPhase() {
 function stagePrompts(): string[] {
   if (phase.value === 2) return travelWords(missionIndex.value)
   if (phase.value === 3) return raceWords(missionIndex.value)
-  return mission.value.id >= 7 ? mission.value.sentences : [...mission.value.words.slice(4), ...mission.value.sentences.slice(0, 1)]
+  const words = [...mission.value.words, ...mission.value.sentences.flatMap(sentence => sentence.split(' '))]
+  return Array.from({ length: 300 }, (_, i) => words[i % words.length]!)
 }
 function startStage() {
+  stopTick()
   prompts.value = stagePrompts(); promptIndex.value = 0; character.value = 0; mistakes.value = 0; correct.value = 0
   failed.value = false; finished.value = false; feedback.value = ''
-  selectedIndex.value = null; clearedIndices.value = []
   rivalProgress.value = [0, 0, 0]; rivalHoldUntil.fill(0); rivalNextHold.fill(0); raceElapsed.value = 0; boostUntil.value = 0
-  const letters = prompts.value.join(' ').length
-  duration.value = isRoute.value ? 150 : isRace.value ? 90 : Math.max(55, Math.ceil((letters / 5) / (5 + mission.value.id * 2.5) * 60 * 2.1 + 25))
-  seconds.value = duration.value; started.value = Date.now(); lastRaceTick = started.value; raceNow.value = started.value; lastFlightKey.value = started.value; stallSeconds.value = 10; playing.value = true
+  rescueKeys.length = 0; rescueLuck.value = 0; rescueHold.value = 0; rescueElapsed.value = 0; rescuePace.value = 0; rescueAccuracy.value = 0
+  duration.value = isRoute.value ? 150 : 90
+  seconds.value = duration.value; started.value = Date.now(); lastRaceTick = started.value; lastRescueTick = started.value; raceNow.value = started.value; lastFlightKey.value = started.value; stallSeconds.value = 10; playing.value = true
   tick = setInterval(() => {
     const now = Date.now()
     seconds.value = Math.max(0, duration.value - Math.floor((now - started.value) / 1000))
     if (isRoute.value) stallSeconds.value = Math.max(0, 10 - Math.floor((now - lastFlightKey.value) / 1000))
     if (isRace.value) updateRivals(now)
-    if (seconds.value === 0 || (isRoute.value && stallSeconds.value === 0)) void endStage(true)
+    if (isRescue.value) updateLuck(now)
+    if (playing.value && (seconds.value === 0 || (isRoute.value && stallSeconds.value === 0))) void endStage(true)
   }, 100)
   void nextTick(() => gameInput.value?.focus())
+}
+function updateLuck(now: number) {
+  const delta = Math.min(.25, Math.max(0, (now - lastRescueTick) / 1000))
+  lastRescueTick = now
+  rescueElapsed.value = Math.min(90, (now - started.value) / 1000)
+  while (rescueKeys.length && rescueKeys[0]!.time < now - 6000) rescueKeys.shift()
+  const hits = rescueKeys.filter(key => key.correct).length
+  const accuracy = rescueKeys.length ? hits / rescueKeys.length : 0
+  rescueAccuracy.value = Math.round(accuracy * 100)
+  const windowSeconds = Math.min(6, rescueElapsed.value)
+  rescuePace.value = windowSeconds ? Math.round(hits / 5 / windowSeconds * 60 * accuracy) : 0
+  const steady = rescueElapsed.value >= 3 && hits >= Math.max(4, Math.ceil(rescueTarget.value / 3)) && accuracy >= .92 && hits / 5 / windowSeconds * 60 * accuracy >= rescueTarget.value
+  rescueLuck.value = Math.max(0, Math.min(100, rescueLuck.value + (steady ? 18 : -23) * delta))
+  rescueHold.value = steady && rescueLuck.value >= 100 ? rescueHold.value + delta : 0
+  if (rescueHold.value >= 15) void endStage()
 }
 function updateRivals(now: number) {
   const delta = Math.min(.25, (now - lastRaceTick) / 1000)
@@ -192,9 +216,9 @@ async function endStage(timeout = false) {
   const acc = hits + miss ? hits / (hits + miss) : 0
   const elapsed = Math.max(1, (Date.now() - started.value) / 1000)
   const wpm = Math.round((hits / 5) / (elapsed / 60))
-  failed.value = timeout || (isRace.value && elapsed >= 90) || (phase.value === 4 && miss >= 4)
-  if (failed.value) { feedback.value = isRace.value ? 'The poachers are almost at the finish! Reach it within 90 seconds to win. Your next try starts at the line.' : isRoute.value ? seconds.value === 0 ? 'The flight ran out of time and the plane crashed. Restart from Auckland!' : 'The plane stalled and crashed. Keep typing to stay in the air!' : timeout ? 'Time is up. Take a breath and try again!' : 'The equipment needs a reset. Try again with steady hands!'; return }
-  const stars = isRoute.value || isRace.value ? Math.max(1, Math.min(5, Math.floor(wpm * acc / 6))) : Math.max(1, Math.min(5, Math.round(acc * 3 + (seconds.value / duration.value) * 2)))
+  failed.value = timeout || (isRace.value && elapsed >= 90)
+  if (failed.value) { feedback.value = isRescue.value ? 'No sighting on this camera watch. Try again: type steadily and accurately to fill the Luck meter, then keep it green for 15 seconds.' : isRace.value ? 'The poachers are almost at the finish! Reach it within 90 seconds to win. Your next try starts at the line.' : seconds.value === 0 ? 'The flight ran out of time and the plane crashed. Restart from Auckland!' : 'The plane stalled and crashed. Keep typing to stay in the air!'; return }
+  const stars = Math.max(1, Math.min(5, Math.floor(wpm * acc / (isRescue.value ? (rescueTarget.value + 2) / 5 : 6))))
   const gold = stars * 10 + Math.round(acc * 10)
   outcome.value = { stars, gold, wpm, accuracy: Math.round(acc * 100) }
   try { await saveResult(mission.value.id, `stage-${phase.value}`, stars, gold, outcome.value.accuracy, wpm); refresh() }
@@ -206,31 +230,20 @@ function typeKey(key: string) {
    if (key === expected.value) {
      correct.value++; character.value++; feedback.value = ''
      if (isRoute.value) { lastFlightKey.value = Date.now(); stallSeconds.value = 10 }
-     if (isRace.value) { boostUntil.value = Date.now() + 300; raceNow.value = Date.now() }
-    if (character.value >= currentPrompt.value.length) {
-      if (isBoard.value && selectedIndex.value !== null) { clearedIndices.value.push(selectedIndex.value); selectedIndex.value = null }
-       promptIndex.value++; character.value = 0
-       if (promptIndex.value >= prompts.value.length) void endStage()
+      if (isRace.value) { boostUntil.value = Date.now() + 300; raceNow.value = Date.now() }
+      if (isRescue.value) rescueKeys.push({ time: Date.now(), correct: true })
+     if (character.value >= currentPrompt.value.length) {
+        promptIndex.value++; character.value = 0
+        if (isRescue.value && promptIndex.value >= prompts.value.length) promptIndex.value = 0
+        else if (promptIndex.value >= prompts.value.length) void endStage()
     }
   } else {
-    mistakes.value++
-    feedback.value = `Try ${expected.value === ' ' ? 'Space' : expected.value.toUpperCase()} again. Stay on this letter.`
-    if (!isRace.value) speak(expected.value === ' ' ? 'space' : expected.value.toUpperCase())
-    if (phase.value === 4 && mistakes.value >= 4) void endStage()
-  }
-}
-function pickBoard(index: number) {
-  if (!playing.value || clearedIndices.value.includes(index)) return
-  if (['radio','journal'].includes(boardKind.value) && index !== promptIndex.value) {
-    mistakes.value++
-    feedback.value = boardKind.value === 'radio' ? `Wrong frequency. Find ${prompts.value[promptIndex.value]}.` : `That page comes later. Find page ${promptIndex.value + 1}.`
-    if (phase.value === 4 && mistakes.value >= 4) void endStage()
-    return
-  }
-  if (selectedIndex.value !== null && character.value > 0) { feedback.value = 'Finish this clue before switching stations.'; return }
-  selectedIndex.value = index; character.value = 0; feedback.value = 'Clue selected. Type it to complete the action.'
-  sayPrompt(); void nextTick(() => gameInput.value?.focus())
-}
+     mistakes.value++
+     if (isRescue.value) rescueKeys.push({ time: Date.now(), correct: false })
+     feedback.value = `Try ${expected.value === ' ' ? 'Space' : expected.value.toUpperCase()} again. Stay on this letter.`
+     if (!isRace.value && !isRescue.value) speak(expected.value === ' ' ? 'space' : expected.value.toUpperCase())
+   }
+ }
 function keydown(event: KeyboardEvent) {
   if (page.value === 'mission' && playing.value) {
     if (event.key === 'Tab' || event.key === 'Escape' || event.ctrlKey || event.metaKey || event.altKey) return
@@ -335,12 +348,12 @@ function licenseUrl(license: string) {
 
       <div v-if="ready && page==='map'" class="content"><div class="page-head"><div class="eyebrow">THE EXPEDITION MAP</div><h1>Choose your <em>mission.</em></h1><p>Ten real animals from Forrest's wildlife adventures. Complete a report to unlock the next stop.</p></div><div class="mission-grid"><button v-for="(m,i) in missions" :key="m.id" class="mission-card" :class="{locked:i>=unlocked}" :disabled="i>=unlocked" @click="openMission(i)"><div class="mission-art" :style="{'--accent':m.color}"><img :src="animalImages[i]!.src" :alt="animalImages[i]!.note" loading="lazy"/><span class="number-badge">{{ String(m.id).padStart(2,'0') }}</span><span class="photo-type">{{ animalImages[i]!.note }}</span></div><div class="mission-card-body"><div class="eyebrow">{{ m.habitat }} · {{ m.region }}</div><h3>{{ m.animal }}</h3><p>{{ m.focus }}</p><div class="mission-card-foot"><span>{{ completed.has(m.id) ? '✓ REPORT SENT' : i>=unlocked ? '🔒 LOCKED' : '● READY TO EXPLORE' }}</span><span>↗</span></div></div></button></div><p class="source-note">Animals are species featured in <a :href="source" target="_blank" rel="noopener">Extinct or Alive episode listings ↗</a>. Images are credited individually in the field report and trophy shelf. Expeditions are fictional.</p></div>
 
-      <div v-if="ready && page==='mission'" class="content mission-content"><button class="back-link" @click="go('map')">← Back to mission map</button><div class="mission-header"><div><div class="eyebrow">MISSION {{ String(mission.id).padStart(2,'0') }} / 10 · {{ mission.region.toUpperCase() }}</div><h1>{{ mission.animal }}</h1><p>{{ mission.habitat }} · Near {{ mission.place }}, {{ mission.region }}</p></div><div class="mission-icon" :style="{'--accent':mission.color}"><img :src="animalImages[missionIndex]!.src" :alt="animalImages[missionIndex]!.note"/></div></div>
-        <div class="stepper"><div v-for="(label,i) in ['Briefing','Lesson','Travel','Fieldwork','Rescue','Report']" :key="label" :class="{current:phase===i,passed:phase>i}"><span>{{ phase>i ? '✓' : i+1 }}</span>{{ label }}</div></div>
+       <div v-if="ready && page==='mission'" class="content mission-content"><button class="back-link" @click="go('map')">← Back to mission map</button><div class="mission-header"><div><div class="eyebrow">MISSION {{ String(mission.id).padStart(2,'0') }} / 10 · {{ mission.region.toUpperCase() }}</div><h1>{{ mission.animal }}</h1><p>{{ mission.habitat }} · Near {{ mission.place }}, {{ mission.region }}</p></div><div class="mission-icon" :style="{'--accent':mission.color}"><span v-if="isRescue && !finished" aria-label="Animal hidden until camera watch complete">?</span><img v-else :src="animalImages[missionIndex]!.src" :alt="animalImages[missionIndex]!.note"/></div></div>
+         <div class="stepper"><div v-for="(label,i) in ['Briefing','Lesson','Travel','Fieldwork','Rescue','Report']" :key="label" :class="{current:phase===i,passed:phase>i}"><span>{{ phase>i ? '✓' : i+1 }}</span>{{ label }}</div></div>
         <template v-if="phase===0"><div class="paper-card brief-card"><div class="eyebrow">✉ &nbsp; INCOMING FIELD MESSAGE</div><h2>Message from your expedition guide</h2><p class="quote">“{{ mission.brief }}”</p><div class="signoff">Adventure awaits, <b>Forrest-inspired guide ✳</b></div></div><div class="fact-strip"><span>ⓘ</span><p><b>Real-world field note:</b> {{ mission.fact }}</p></div><button class="primary-btn" @click="nextPhase">Open your field lesson <span>→</span></button></template>
         <template v-else-if="phase===1"><div class="paper-card lesson-card"><div class="eyebrow">KEYBOARD FIELD GUIDE</div><h2>{{ mission.focus }}</h2><p>{{ mission.tip }}</p><div class="lesson-columns"><div><h3>Before you begin</h3><ul><li>Rest your fingers on <b>A S D F</b> and <b>J K L ;</b>.</li><li>Feel the little bumps on <b>F</b> and <b>J</b>.</li><li>Look at the screen, not down at the keys.</li><li>Type with the suggested finger. Mistakes never skip a letter.</li></ul></div><div class="lesson-example"><small>YOU'LL PRACTICE</small><div>{{ mission.words.slice(1,5).join(' · ') }}</div><span>Real words. Real clues. Your pace.</span></div></div></div><button class="primary-btn" @click="nextPhase">Let's go to {{ mission.region }} <span>→</span></button></template>
-        <template v-else-if="phase>=2 && phase<=4"><div class="game-layout" :class="{'travel-layout':isRoute,'race-layout':isRace}"><div class="game-main"><div class="paper-card game-card"><div class="game-top"><div><div class="eyebrow">STAGE {{ phase-1 }} OF 3 · {{ phase===2?'TRAVEL':phase===3?'FIELDWORK':'RESCUE' }}</div><h2>{{ stageName }}</h2></div><div v-if="playing" class="timer" :class="{urgent:seconds<12}">◷ {{ seconds }}s</div></div><p v-if="!playing && !finished && !failed" class="game-instruction">{{ isRoute ? `Fly from Auckland to ${mission.place}. Type the words in order to draw your flight path. Keep typing: after 10 seconds without a correct key the plane crashes! You have 2½ minutes. Five stars starts at 30 WPM × accuracy.` : isRace ? `Race three poacher vehicles to the field site through ${mission.habitat.toLowerCase()} country. Each correct key boosts your car; mistakes cost time, but you can catch up. Finish within 90 seconds to win and continue.` : `Choose the clues and complete each rescue task. Four mistakes will reset your tools.` }}</p><div v-if="!playing && !finished && !failed" class="preflight"><span>⌨</span><div><b>Ready when you are.</b><small>{{ isRoute ? '60 familiar words · Space between words · 30 adjusted WPM for ★★★★★' : isRace ? 'Space between words · Rivals finish at 91s, 100s, 110s · 30 adjusted WPM for ★★★★★' : `Target pace: ${5+mission.id*2.5} WPM · 4 tool strikes available` }}</small></div><button class="primary-btn" @click="startStage">{{ isRoute?'Take off →':isRace?'Start race →':'Start stage →' }}</button></div>
-           <template v-if="playing || (failed && (isRoute || isRace)) || (finished && isRace)">
+         <template v-else-if="phase>=2 && phase<=4"><div class="game-layout" :class="{'travel-layout':isRoute,'race-layout':isRace,'rescue-layout':isRescue}"><div class="game-main"><div class="paper-card game-card"><div class="game-top"><div><div class="eyebrow">STAGE {{ phase-1 }} OF 3 · {{ phase===2?'TRAVEL':phase===3?'FIELDWORK':'RESCUE' }}</div><h2>{{ stageName }}</h2></div><div v-if="playing" class="timer" :class="{urgent:seconds<12}">◷ {{ seconds }}s</div></div><p v-if="!playing && !finished && !failed" class="game-instruction">{{ isRoute ? `Fly from Auckland to ${mission.place}. Type the words in order to draw your flight path. Keep typing: after 10 seconds without a correct key the plane crashes! You have 2½ minutes. Five stars starts at 30 WPM × accuracy.` : isRace ? `Race three poacher vehicles to the field site through ${mission.habitat.toLowerCase()} country. Each correct key boosts your car; mistakes cost time, but you can catch up. Finish within 90 seconds to win and continue.` : `Finding an animal in the wild requires patience, skill and some luck! Type steadily at ${rescueTarget} adjusted WPM or faster with at least 92% recent accuracy to raise the Luck meter from red to green. Keep typing to hold it green for 15 uninterrupted seconds. You have 90 seconds; otherwise the camera records no sighting and you can try again.` }}</p><div v-if="!playing && !finished && !failed" class="preflight"><span>⌨</span><div><b>Ready when you are.</b><small>{{ isRoute ? '60 familiar words · Space between words · 30 adjusted WPM for ★★★★★' : isRace ? 'Space between words · Rivals finish at 91s, 100s, 110s · 30 adjusted WPM for ★★★★★' : `90-second camera watch · ${rescueTarget} adjusted WPM to fill · ${rescueTarget+2} for ★★★★★` }}</small></div><button class="primary-btn" @click="startStage">{{ isRoute?'Take off →':isRace?'Start race →':'Start camera watch →' }}</button></div>
+            <template v-if="playing || (failed && (isRoute || isRace || isRescue)) || (finished && (isRace || isRescue))">
               <div v-if="isRoute" class="flight-map" :class="{crashed:failed}" role="group" :aria-label="`Flight from Auckland to ${mission.place}; ${Math.round(flightProgress*100)} percent complete`">
                 <div class="flight-world" :style="cameraStyle">
                   <svg class="flight-routes" viewBox="0 0 1000 520" preserveAspectRatio="none" aria-hidden="true"><polyline class="flight-upcoming" :points="routeLine" vector-effect="non-scaling-stroke"/><polyline class="flight-flown" :points="flownLine" vector-effect="non-scaling-stroke"/></svg>
@@ -355,19 +368,17 @@ function licenseUrl(license: string) {
                <div class="race-track"><div class="race-finish-line"><span>FINISH</span></div><div v-for="(rival,i) in rivalProgress" :key="i" class="race-lane"><span class="lane-label">{{ ['RED','BLUE','GOLD'][i] }} · {{ rivalFinishTimes[i] }}s</span><div class="race-car" :class="`rival-${i}`" :style="{left:`${7+rival*83}%`}"><div class="race-driver"><i></i><span></span></div><div class="race-body"><span class="race-wheel"></span><span class="race-wheel"></span></div><small>POACHER {{ i+1 }}</small></div></div><div class="race-lane player-lane"><span class="lane-label">HENRY · YOU</span><div class="race-car player-car" :class="{boost:boosting && playing}" :style="{left:`${7+playerDistance*83}%`}"><div class="race-driver"><i></i><span></span></div><div class="race-body"><span class="race-wheel"></span><span class="race-wheel"></span></div><small>HENRY</small></div></div></div>
                <div class="race-hud"><div class="race-title">{{ finished?'FINISH LINE · HENRY WINS!':failed?'RACE OVER · TRY AGAIN':'TYPE TO BOOST · BEAT 90 SECONDS' }} <span>{{ Math.min(promptIndex+1,prompts.length) }} / {{ prompts.length }} WORDS</span></div><div v-if="playing" class="race-words" aria-label="Words to type"><span v-for="(word,i) in prompts.slice(Math.max(0,promptIndex-1),promptIndex+6)" :key="Math.max(0,promptIndex-1)+i" :class="{past:Math.max(0,promptIndex-1)+i<promptIndex,active:Math.max(0,promptIndex-1)+i===promptIndex}"><template v-if="Math.max(0,promptIndex-1)+i===promptIndex"><b>{{ word.slice(0,character) }}</b><em>{{ expected===' '?'␣':expected }}</em>{{ word.slice(Math.min(character+1,word.length)) }}</template><template v-else>{{ word }}</template></span></div><div v-else class="race-words" :class="{'race-words-lost':failed}">{{ failed?'THE POACHERS ARE CLOSING IN':'YOU MADE IT TO THE FIELD SITE!' }}</div><div class="race-metrics">{{ Math.round(playerDistance*100) }}% to finish · {{ accuracy }}% accuracy · {{ mistakes }} misses <strong>{{ Math.floor(raceElapsed) }} / 90s</strong></div></div>
              </div>
-            <div v-else-if="isBoard" class="field-scene" :class="`scene-${boardKind}`">
-              <div class="scene-title">{{ boardKind==='vines'?'VINE BARRIER':boardKind==='cameras'?'CAMERA TRAP NETWORK':boardKind==='radio'?'RADIO SIGNAL DESK':boardKind==='sonar'?'SONAR SCAN':boardKind==='journal'?'EXPEDITION JOURNAL':boardKind==='lake'?'LAKE OBSERVATION POSTS':boardKind==='lookout'?'BAYOU LOOKOUT':'TRACKING GRID' }} <span>{{ clearedIndices.length }} / {{ prompts.length }} CLEAR</span></div>
-              <p>{{ boardKind==='vines'?'Choose a vine and type its word to cut it.':boardKind==='cameras'?'Log each camera station by typing its clue. The archive specimen image is for reference, not new footage.':boardKind==='radio'?`Find and tune the next signal: ${prompts[promptIndex]}.`:boardKind==='sonar'?'Choose a sonar echo and type its label to identify it.':boardKind==='journal'?`Reassemble the journal in order: find page ${promptIndex+1}.`:'Choose a field marker and record its clue.' }}</p>
-              <div class="field-options">
-                <button v-for="(word,i) in prompts" :key="i" :class="{cleared:clearedIndices.includes(i),selected:selectedIndex===i}" :disabled="clearedIndices.includes(i)" @click="pickBoard(i)"><img v-if="boardKind==='cameras'" class="camera-image" :src="animalImages[missionIndex]!.src" alt=""/><span class="field-symbol">{{ boardKind==='vines'?'╱':boardKind==='cameras'?'▣':boardKind==='radio'?'⌁':boardKind==='sonar'?'◎':boardKind==='journal'?'▤':boardKind==='lake'?'◉':boardKind==='lookout'?'♧':'❖' }}</span><span class="field-word">{{ word }}</span><small>{{ clearedIndices.includes(i)?boardKind==='cameras'?'ARCHIVE REFERENCE':'COMPLETE':boardKind==='vines'?'CUT THIS VINE':boardKind==='journal'?`PAGE ${i+1}`:'SELECT CLUE' }}</small></button>
-              </div>
-            </div>
-              <div v-if="playing && isBoard" class="game-progress"><span>CLUES {{ promptIndex }} / {{ prompts.length }}</span><span>{{ progress }}% COMPLETE</span></div><div v-if="playing && isBoard" class="progress-track"><div :style="{width:progress+'%'}"></div></div>
-              <div v-if="isBoard && currentPrompt" class="typing-prompt" aria-label="Text to type"><span class="typed">{{ currentPrompt.slice(0,character) }}</span><span class="cursor-letter">{{ expected === ' ' ? '␣' : expected }}</span><span>{{ currentPrompt.slice(character+1) }}</span></div>
-              <div v-else-if="isBoard" class="awaiting-prompt">Choose a clue above to begin typing ↑</div>
-              <p v-if="playing && isBoard" class="game-hint">{{ accuracy }}% accuracy · {{ mistakes }} mistakes · Tool strength {{ Math.max(0,4-mistakes) }}/4</p><div v-if="playing" class="feedback" aria-live="polite">{{ feedback || (isRoute ? 'Type the highlighted word and press Space. Keep the plane in the air!' : isRace ? 'Every correct key gives your car a boost. Keep going!' : 'Choose an action, then type the highlighted letters. Wrong keys stay on the same letter.') }}</div><input v-if="playing" ref="gameInput" class="capture-input" aria-label="Type the highlighted text here" autocomplete="off" spellcheck="false" @input="($event.target as HTMLInputElement).value=''" /><button v-if="playing && isBoard && currentPrompt && !currentPrompt.includes(' ')" class="audio-btn" @click="sayPrompt">◖)) Hear word and spelling</button>
+             <div v-else-if="isRescue" class="rescue-scene" :class="[{night:rescueNight,green:rescueLuck>=100,spotted:finished},`habitat-${rescueScene}`]" role="group" :aria-label="`${mission.habitat} camera watch; Luck meter ${Math.round(rescueLuck)} percent; green hold ${Math.floor(rescueHold)} of 15 seconds`">
+               <div :key="rescueSceneIndex" class="rescue-frame"><div class="rescue-landscape"></div><div class="rescue-grain"></div></div>
+               <div class="rescue-camera-tag"><span class="record-light">●</span> CAM {{ String(rescueSceneIndex+1).padStart(2,'0') }} · {{ rescueNight?'NIGHT VISION':'DAYLIGHT' }} <span>{{ mission.habitat.toUpperCase() }} · {{ mission.region.toUpperCase() }}</span></div>
+               <div class="rescue-reticle" aria-hidden="true"><span></span><span></span><span></span><span></span></div>
+               <div v-if="finished" class="rescue-reveal"><div class="rescue-reveal-photo"><img :src="animalImages[missionIndex]!.src" :alt="animalImages[missionIndex]!.note" /></div><div><strong>ANIMAL REVEALED!</strong><h3>{{ mission.animal }}</h3><p>Mission reveal · {{ animalImages[missionIndex]!.note }}. This is a fictional camera-watch game, not footage of a new sighting.</p></div></div>
+               <div v-else-if="failed" class="rescue-no-sighting">NO SIGHTING <small>Camera watch ended · try again</small></div>
+               <div class="rescue-dashboard"><div class="rescue-meter-heading"><strong>✦ LUCK METER</strong><span>{{ rescueLuck>=100 ? `GREEN · HOLD ${Math.floor(rescueHold)} / 15s` : `${Math.round(rescueLuck)}% TO GREEN` }}</span></div><div class="rescue-meter" role="progressbar" aria-label="Luck meter" :aria-valuenow="Math.round(rescueLuck)" aria-valuemin="0" aria-valuemax="100"><div class="rescue-meter-fill" :style="{width:rescueLuck+'%'}"></div><span class="rescue-meter-end">✦</span></div><div class="rescue-hold"><div :style="{width:rescueHold/15*100+'%'}"></div></div><div class="rescue-metrics"><span>RECENT PACE <b>{{ rescuePace }} / {{ rescueTarget }} adjusted WPM</b></span><span>RECENT ACCURACY <b>{{ rescueAccuracy }}% / 92%</b></span><span>HOLD <b>{{ Math.floor(rescueHold) }} / 15s</b></span></div><div v-if="playing" class="rescue-words" aria-label="Words to type"><span v-for="(word,i) in prompts.slice(Math.max(0,promptIndex-1),promptIndex+6)" :key="Math.max(0,promptIndex-1)+i" :class="{past:Math.max(0,promptIndex-1)+i<promptIndex,active:Math.max(0,promptIndex-1)+i===promptIndex}"><template v-if="Math.max(0,promptIndex-1)+i===promptIndex"><b>{{ word.slice(0,character) }}</b><em>{{ expected===' '?'␣':expected }}</em>{{ word.slice(Math.min(character+1,word.length)) }}</template><template v-else>{{ word }}</template></span></div></div>
+             </div>
+               <div v-if="playing" class="feedback" aria-live="polite">{{ feedback || (isRoute ? 'Type the highlighted word and press Space. Keep the plane in the air!' : isRace ? 'Every correct key gives your car a boost. Keep going!' : 'Keep a steady rhythm! The Luck meter drains if your pace or accuracy drops.') }}</div><input v-if="playing" ref="gameInput" class="capture-input" aria-label="Type the highlighted text here" autocomplete="off" spellcheck="false" @input="($event.target as HTMLInputElement).value=''" />
            </template>
-           <div v-if="failed" class="stage-result"><span class="result-symbol">↺</span><h3>{{ isRoute?'Flight crashed!':isRace?'The poachers got ahead!':'Let’s try that again.' }}</h3><p>{{ feedback }}</p><button class="primary-btn" @click="startStage">{{ isRoute?'Fly again from Auckland →':isRace?'Retry race →':'Restart stage →' }}</button></div><div v-if="finished" class="stage-result"><span class="result-symbol">✦</span><h3>{{ isRoute?'Touchdown, Henry!':isRace?'You won the race!':'Trail complete, Henry!' }}</h3><div class="stars">{{ '★'.repeat(outcome.stars) }}{{ '☆'.repeat(5-outcome.stars) }}</div><p>{{ outcome.accuracy }}% accuracy · {{ outcome.wpm }} WPM<span v-if="isRoute || isRace"> · {{ Math.round(outcome.wpm*outcome.accuracy/100) }} adjusted WPM</span> · +{{ outcome.gold }} gold</p><button class="primary-btn" @click="nextPhase">{{ phase===4?'Write your field report':'Next stage' }} →</button></div></div></div>
+            <div v-if="failed" class="stage-result"><span class="result-symbol">↺</span><h3>{{ isRoute?'Flight crashed!':isRace?'The poachers got ahead!':'No sighting this time.' }}</h3><p>{{ feedback }}</p><button class="primary-btn" @click="startStage">{{ isRoute?'Fly again from Auckland →':isRace?'Retry race →':'Retry camera watch →' }}</button></div><div v-if="finished" class="stage-result"><span class="result-symbol">✦</span><h3>{{ isRoute?'Touchdown, Henry!':isRace?'You won the race!':'Animal revealed, Henry!' }}</h3><div class="stars">{{ '★'.repeat(outcome.stars) }}{{ '☆'.repeat(5-outcome.stars) }}</div><p>{{ outcome.accuracy }}% accuracy · {{ outcome.wpm }} WPM · {{ Math.round(outcome.wpm*outcome.accuracy/100) }} adjusted WPM · +{{ outcome.gold }} gold</p><button class="primary-btn" @click="nextPhase">{{ phase===4?'Write your field report':'Next stage' }} →</button></div></div></div>
            <aside class="game-aside"><div class="keyboard-card"><div class="eyebrow">FINGER GUIDE</div><h3>{{ playing ? (expected===' '?'Space bar':shownKey) : 'Home row' }}</h3><p>{{ playing ? finger : 'Find F and J without looking down.' }} <span v-if="playing && expected!==expected.toLowerCase()">· Hold opposite Shift</span></p><div class="split-keyboard"><div class="key-half" v-for="(half,hi) in [leftKeys,rightKeys]" :key="hi"><div v-for="(row,ri) in half" :key="ri" class="key-row"><span v-for="key in row" :key="key" :class="{lit:playing && key===shownKey,home:['A','S','D','F','J','K','L',';'].includes(key)}">{{ key }}</span></div></div></div><div class="space-key" :class="{lit:playing && expected===' '}">SPACE · thumbs</div><div class="finger-legend"><span>● pinky</span><span>● ring</span><span>● middle</span><span>● index</span></div></div><div class="tip-card compact"><div class="tip-symbol">✳</div><div><div class="eyebrow">FIELD REMINDER</div><p>Eyes on the screen. Fingers on the home row. Every accurate key counts.</p></div></div></aside></div></template>
         <template v-else-if="phase===5"><div class="report-layout"><div class="paper-card report-card"><div class="eyebrow">✉ &nbsp; FIELD REPORT</div><h2>Write to your expedition guide</h2><p>Tell Forrest about the {{ mission.animal }}. Where does it live? What did you notice? What would you like to ask?</p><textarea v-model="reportText" :disabled="!!reportReply" placeholder="Dear Forrest, Today I learned about..." rows="8" aria-label="Your field report"></textarea><div class="report-actions"><button class="primary-btn" :disabled="aiBusy || !apiKey || !online" @click="checkWriting">{{ aiBusy?'Checking…':'Check my writing ✳' }}</button><span v-if="!apiKey || !online" class="unavailable">AI check unavailable · {{ !apiKey?'add a key in Settings':'offline' }}</span></div><div v-if="aiError" class="inline-error" role="alert">{{ aiError }}</div><div v-if="corrections.length && reportText===checkedText" class="corrections"><h3>Let's fix these first</h3><div v-for="(c,i) in corrections" :key="i"><s>{{ c.original }}</s> → <b>{{ c.replacement }}</b><p>{{ c.explanation }}</p></div><small>Edit your letter, then check again.</small></div><div v-if="reportText===checkedText && !corrections.length && checkedText && !aiError" class="success-box">✓ Great writing! Your report is ready to send.</div><div class="report-actions"><button v-if="reportText===checkedText && !corrections.length && checkedText && !aiError" class="primary-btn" :disabled="aiBusy" @click="sendReport">{{ aiBusy?'Sending…':'Send report & get reply →' }}</button><button class="secondary-btn" @click="localReport">Finish offline with a local reply →</button></div></div><div class="report-sidebar"><div class="animal-tile large"><img :src="animalImages[missionIndex]!.src" :alt="animalImages[missionIndex]!.note"/></div><h3>{{ mission.animal }}</h3><p>{{ mission.fact }}</p><small class="image-credit">{{ animalImages[missionIndex]!.note }} · <a :href="animalImages[missionIndex]!.source" target="_blank" rel="noopener">{{ animalImages[missionIndex]!.credit }} ↗</a> · <a :href="licenseUrl(animalImages[missionIndex]!.license)" target="_blank" rel="noopener">{{ animalImages[missionIndex]!.license }}</a></small><small>AI replies are fictional game messages inspired by an explorer, not actual messages from Forrest Galante.</small></div></div></template>
         <template v-else><div class="paper-card complete-card"><div class="eyebrow">MISSION {{ mission.id }} COMPLETE</div><div class="big-trophy">🏆 <img :src="animalImages[missionIndex]!.src" :alt="animalImages[missionIndex]!.note"/></div><h2>A new trophy for your shelf!</h2><p>You helped document the {{ mission.animal }}. Your field notes are saved and a new adventure awaits.</p><div class="reply-card"><div class="eyebrow">✉ &nbsp; REPLY FROM YOUR EXPEDITION GUIDE</div><p>“{{ reportReply }}”</p></div><div class="complete-actions"><button class="primary-btn" v-if="missionIndex<9" @click="openMission(missionIndex+1)">Next mission →</button><button class="secondary-btn" @click="go('shelf')">Visit trophy shelf</button></div></div></template>
