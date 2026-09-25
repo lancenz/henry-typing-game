@@ -139,8 +139,8 @@ async function race(page, number) {
 async function finishMission(page, number) {
   if (number === 1) await page.getByRole('button', { name: 'Start your first mission' }).click()
   else await page.getByRole('button', { name: 'Next mission' }).click()
-  await page.getByRole('button', { name: 'Open your field lesson' }).click()
-  await page.getByRole('button', { name: /Let's go to/ }).click()
+  assert.equal(await page.locator('.stepper > div').count(), 5)
+  await page.getByRole('button', { name: 'Begin travel' }).click()
   await page.getByRole('button', { name: 'Take off' }).click()
   await flyRoute(page, number)
   if (number === 1) await page.clock.install()
@@ -155,6 +155,59 @@ async function finishMission(page, number) {
   await page.getByRole('heading', { name: 'A new trophy for your shelf!' }).waitFor()
 }
 
+async function testSkipsAndReport(browser) {
+  const page = await browser.newPage()
+  try {
+    page.on('pageerror', error => { throw error })
+    await page.goto(`http://localhost:${port}/`)
+    await page.getByRole('button', { name: 'Start your first mission' }).waitFor()
+    await page.getByRole('button', { name: 'Settings' }).click()
+    await page.getByLabel('OPENROUTER API KEY').fill('testing-only-key')
+    await page.getByRole('button', { name: 'Save settings' }).click()
+    await page.getByRole('status').getByText('Settings saved on this device.').waitFor()
+    await page.getByRole('button', { name: 'Base camp' }).click()
+    await page.getByRole('button', { name: 'Start your first mission' }).click()
+    assert.equal(await page.locator('.stepper > div').count(), 5)
+    assert.equal(await page.locator('.stepper').innerText().then(text => text.includes('Lesson')), false)
+    await page.getByRole('button', { name: 'Begin travel' }).click()
+    await page.getByRole('button', { name: 'Take off' }).click()
+    await page.getByRole('button', { name: 'Skip Travel (testing)' }).click()
+    assert(await page.getByRole('heading', { name: 'Race to the field site' }).isVisible())
+    await page.getByRole('button', { name: 'Skip Fieldwork (testing)' }).click()
+    await page.getByRole('button', { name: 'Start camera watch' }).click()
+    await page.getByRole('button', { name: 'Skip Rescue (testing)' }).click()
+    assert(await page.getByRole('heading', { name: 'Write to your expedition guide' }).isVisible())
+    assert.match(await page.locator('.gold-pill').innerText(), /0 GOLD/)
+
+    let checks = 0
+    let replies = 0
+    await page.route('https://openrouter.ai/api/v1/chat/completions', async route => {
+      const body = route.request().postDataJSON()
+      const isCheck = body.messages[0].content.includes('punctuation coach')
+      const content = isCheck
+        ? [JSON.stringify({ corrections: [{ original: 'teh', replacement: 'the', explanation: 'Check the spelling.' }] }), 'No errors found in your writing.', '{"corrections":[]}'][checks++]
+        : (replies++, 'Thank you, Henry! Your careful notes will help us protect the forest.')
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ choices: [{ message: { content } }] }) })
+    })
+    const report = page.getByRole('textbox', { name: 'Your field report' })
+    await report.fill('Dear Forrest, I saw teh trees and listened for the animal.')
+    await page.getByRole('button', { name: 'Check my writing' }).click()
+    await page.getByRole('heading', { name: "Let's fix these first" }).waitFor()
+    assert.equal(await page.getByRole('button', { name: 'Send report & get reply' }).count(), 0)
+    await report.fill('Dear Forrest, I saw the trees and listened for the animal.')
+    await page.getByRole('button', { name: 'Check my writing' }).click()
+    await page.getByText('Great writing! Your report is ready to send.').waitFor()
+    await report.fill('Dear Forrest, I saw the trees and listened for an animal.')
+    assert.equal(await page.getByRole('button', { name: 'Send report & get reply' }).count(), 0)
+    await page.getByRole('button', { name: 'Check my writing' }).click()
+    await page.getByText('Great writing! Your report is ready to send.').waitFor()
+    await page.getByRole('button', { name: 'Send report & get reply' }).click()
+    await page.getByRole('heading', { name: 'A new trophy for your shelf!' }).waitFor()
+    assert.equal(checks, 3)
+    assert.equal(replies, 1)
+  } finally { await page.close() }
+}
+
 try {
   await waitForServer()
   const chrome = [process.env.CHROME_PATH, '/usr/bin/google-chrome', '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', process.env.PROGRAMFILES && `${process.env.PROGRAMFILES}/Google/Chrome/Application/chrome.exe`].find(path => path && existsSync(path))
@@ -166,6 +219,7 @@ try {
   assert(await page.evaluate(() => document.fonts.check('16px "Atkinson Hyperlegible Next"')))
   assert(await page.locator('.hero-art img').evaluate(image => image.complete && image.naturalWidth > 0))
   for (let number = 1; number <= 10; number++) await finishMission(page, number)
+  await testSkipsAndReport(browser)
   await page.getByRole('button', { name: 'Visit trophy shelf' }).click()
   assert.equal(await page.locator('.trophy-card:not(.empty)').count(), 10)
   await page.reload()
@@ -179,7 +233,7 @@ try {
   assert(await page.locator('.trophy-figure img').first().evaluate(image => image.complete && image.naturalWidth > 0))
   assert(await page.evaluate(async () => (await fetch('/world-map.svg')).ok))
   assert(await page.evaluate(async () => (await Promise.all(['/race-forest.svg','/race-mountains.svg','/race-shore.svg',...['forest','highland','water','wetland'].flatMap(habitat => [`/camera-${habitat}.svg`,`/camera-${habitat}-night.svg`])].map(path => fetch(path)))).every(response => response.ok)))
-  console.log('Smoke test passed: all 10 missions, flight, race, Luck meter rescue win/loss/retry, reports, persistence and offline assets.')
+  console.log('Smoke test passed: all 10 missions, flight, race, rescue, testing skips, AI report with no corrections, persistence and offline assets.')
 } finally {
   await browser?.close()
   server.kill('SIGTERM')
